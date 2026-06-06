@@ -112,14 +112,17 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version     = "4.9.2"
-$Script:TenantName  = "Unknown"
-$Script:TenantId    = "Unknown"
-$Script:OutputPath  = $Script:OutputPath
-$Script:StartTime   = Get-Date
-$Script:Findings    = [System.Collections.Generic.List[hashtable]]::new()
-$Script:DebugLog    = [System.Collections.Generic.List[hashtable]]::new()
-$Script:ModuleTimes = @{}
+$Script:Version         = "5.0.0"
+$Script:TenantName      = "Unknown"
+$Script:TenantId        = "Unknown"
+$Script:OutputPath      = $Script:OutputPath
+$Script:PrimaryDomain   = ""
+$Script:UserDomains     = @()
+$Script:AcceptedDomains = @()
+$Script:StartTime       = Get-Date
+$Script:Findings        = [System.Collections.Generic.List[hashtable]]::new()
+$Script:DebugLog        = [System.Collections.Generic.List[hashtable]]::new()
+$Script:ModuleTimes     = @{}
 $Script:ModuleOrder = [System.Collections.Generic.List[string]]::new()
 $Script:Stats       = @{ CRITICAL = 0; HIGH = 0; MEDIUM = 0; LOW = 0; INFO = 0 }
 $Script:StartDate   = (Get-Date).AddDays(-$DaysBack)
@@ -334,7 +337,7 @@ function Show-Banner {
     Write-Host @"
 
   +===============================================================+
-  |              IR-O365  v4.9.2                                  |
+  |              IR-O365  v5.0.0                                  |
   |         MITRE ATT&CK Enterprise - Office Suite Mapped         |
   +===============================================================+
   |  Taticas: Initial Access | Persistence | Defense Evasion      |
@@ -475,38 +478,45 @@ function Connect-IRServices {
     $exoCmd          = Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue
     $hasDeviceParam  = $exoCmd -and $exoCmd.Parameters -and $exoCmd.Parameters.ContainsKey("UseDeviceAuthentication")
 
-    if ($hasDeviceParam) {
-        # EXO suporta Device Code - usar directamente (evita broker WAM)
-        Write-Host "  Vai a: https://microsoft.com/devicelogin" -ForegroundColor Cyan
-        try {
-            Connect-ExchangeOnline -ShowBanner:$false -UseDeviceAuthentication -ErrorAction Stop
-            Write-IRLog "Exchange Online: Conectado via Device Code" -Severity "SUCCESS"
-        } catch {
-            Write-IRLog "Exchange Online: Device Code falhou - $($_.Exception.Message.Split([char]10)[0])" -Severity "MEDIUM"
-            Write-Host "  EXO nao disponivel - modulos Exchange serao ignorados." -ForegroundColor Yellow
-            $Script:SkipExchange = $true
-            $Script:SkipUAL      = $true
-        }
-    } else {
-        # EXO nao suporta Device Code nesta build - tentar interativo
-        Write-Host "  Nota: EXO v$((Get-Module ExchangeOnlineManagement -ErrorAction SilentlyContinue).Version) - a tentar autenticacao interativa..." -ForegroundColor DarkGray
-        try {
-            Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
-            Write-IRLog "Exchange Online: Conectado" -Severity "SUCCESS"
-        } catch {
-            $err = $_.Exception.Message
-            if ($err -match "WithBroker|MissingMethodException|BrokerExtension") {
-                Write-IRLog "Exchange Online: Broker WAM incompativel (.NET 4.8 + PS5.1)" -Severity "MEDIUM"
-                Write-Host ""
-                Write-Host "  EXO nao disponivel neste ambiente." -ForegroundColor Yellow
-                Write-Host "  Para EXO: instalar PS7 (winget install --id Microsoft.PowerShell)" -ForegroundColor DarkGray
-                Write-Host "  A continuar com modulos Graph apenas." -ForegroundColor Gray
+    # Tentar primeiro autenticacao interactiva normal
+    $exoConnected = $false
+    try {
+        Write-Host "  A aguardar autenticacao..." -ForegroundColor DarkGray
+        Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+        Write-IRLog "Exchange Online: Conectado" -Severity "SUCCESS"
+        $exoConnected = $true
+    } catch {
+        $err = $_.Exception.Message
+        $isBrokerError = $err -match "WithBroker|MissingMethodException|BrokerExtension|NullReferenceException|RuntimeBroker|Object reference"
+        if ($isBrokerError) {
+            # Broker falhou (PS5.1 WAM ou PS7 headless) - tentar Device Code se disponivel
+            if ($hasDeviceParam) {
+                Write-Host "  Broker incompativel - a tentar Device Code..." -ForegroundColor Yellow
+                Write-Host "  Vai a: https://microsoft.com/devicelogin" -ForegroundColor Cyan
+                try {
+                    Connect-ExchangeOnline -ShowBanner:$false -UseDeviceAuthentication -ErrorAction Stop
+                    Write-IRLog "Exchange Online: Conectado via Device Code" -Severity "SUCCESS"
+                    $exoConnected = $true
+                } catch {
+                    Write-IRLog "Exchange Online: Device Code falhou - $($_.Exception.Message.Split([char]10)[0])" -Severity "MEDIUM"
+                }
             } else {
-                Write-IRLog "Exchange Online: $($err.Split([char]10)[0])" -Severity "MEDIUM"
+                $exoVer = (Get-Module ExchangeOnlineManagement -ErrorAction SilentlyContinue).Version
+                Write-IRLog "Exchange Online: Broker incompativel (EXO v${exoVer})" -Severity "MEDIUM"
+                Write-Host "  Broker incompativel e Device Code nao suportado nesta build." -ForegroundColor Yellow
+                Write-Host "  Actualizar: Update-Module ExchangeOnlineManagement -Force" -ForegroundColor DarkGray
             }
-            $Script:SkipExchange = $true
-            $Script:SkipUAL      = $true
+        } else {
+            Write-IRLog "Exchange Online: $($err.Split([char]10)[0])" -Severity "MEDIUM"
         }
+    }
+
+    if (-not $exoConnected) {
+        Write-Host ""
+        Write-Host "  EXO nao disponivel - modulos Exchange e UAL serao ignorados." -ForegroundColor Yellow
+        Write-Host "  A continuar com modulos Graph apenas." -ForegroundColor Gray
+        $Script:SkipExchange = $true
+        $Script:SkipUAL      = $true
     }
 
     Write-Host ""
@@ -530,18 +540,33 @@ function Get-TenantBaseline {
     
     try {
         $org = Get-MgOrganization -ErrorAction Stop
-        $tenantInfo = [PSCustomObject]@{
-            TenantId         = $org.Id
-            DisplayName      = $org.DisplayName
-            Domains          = ($org.VerifiedDomains | ForEach-Object { $_.Name }) -join ", "
-            CreatedDate      = $org.CreatedDateTime
-        }
-                # Display name completo com acentos (para HTML report e logs)
+        # ---- Capturar dominios do tenant ----
+        $allDomains = @(Get-MgDomain -ErrorAction SilentlyContinue)
+
+        $Script:AcceptedDomains = @($allDomains | Where-Object { $_.IsVerified } | ForEach-Object { $_.Id })
+        $defaultDom = $allDomains | Where-Object { $_.IsDefault } | Select-Object -First 1
+        $Script:PrimaryDomain   = if ($defaultDom) { $defaultDom.Id } else { $Script:AcceptedDomains | Select-Object -First 1 }
+        # Dominios de utilizadores = verificados, excluindo dominios geridos pela Microsoft
+        $Script:UserDomains     = @($allDomains | Where-Object {
+            $_.IsVerified -and $_.Id -notmatch "\.onmicrosoft\.com$"
+        } | ForEach-Object { $_.Id })
+
         $Script:TenantName = $org.DisplayName.Trim()
         $Script:TenantId   = $org.Id
         Write-IRLog "Tenant: $($Script:TenantName) | ID: $($Script:TenantId)" -Severity "INFO"
+        Write-IRLog "Dominio principal: $($Script:PrimaryDomain)" -Severity "INFO"
+        if ($Script:UserDomains.Count -gt 1) {
+            Write-IRLog "Dominios de utilizadores ($($Script:UserDomains.Count)): $($Script:UserDomains -join ', ')" -Severity "INFO"
+        }
 
-        # Pasta: .\ reports\IR-O365-YYYYMMDD_HHMMSS\ (sem rename por tenant)
+        $tenantInfo = [PSCustomObject]@{
+            TenantId       = $org.Id
+            DisplayName    = $org.DisplayName
+            PrimaryDomain  = $Script:PrimaryDomain
+            UserDomains    = $Script:UserDomains -join ", "
+            AllDomains     = $Script:AcceptedDomains -join ", "
+            CreatedDate    = $org.CreatedDateTime
+        }
         Export-IRData -FileName "00_tenant_baseline" -Data @($tenantInfo)
         
         # Verificar Security Defaults
@@ -772,7 +797,8 @@ function Get-MFAStatus {
     
     try {
         # Admins sem MFA
-        Write-Host "  >> Verificando admins sem MFA..." -ForegroundColor Gray
+        $mfaDomainCtx = if ($Script:UserDomains.Count -gt 0) { $Script:UserDomains -join ", " } else { "tenant" }
+        Write-Host "  >> Verificando admins sem MFA (dominios: $mfaDomainCtx)..." -ForegroundColor Gray
         $privilegedRoles = @(
             "62e90394-69f5-4237-9190-012177145e10",  # Global Administrator
             "194ae4cb-b126-40b2-bd5b-6091b380977d",  # Security Administrator
@@ -2249,6 +2275,8 @@ code,pre,.mono{font-family:var(--mono);font-size:.85em}
   <div class="sh">Informacao de Execucao</div>
   <div class="rgrid">
     <div class="rrow"><span class="rk">Tenant</span><span class="rv">$(hx $Script:TenantName)</span></div>
+    <div class="rrow"><span class="rk">Dominio principal</span><span class="rv">$(hx $Script:PrimaryDomain)</span></div>
+    <div class="rrow"><span class="rk">Dominios analisados</span><span class="rv" style="font-size:.68rem">$(hx ($Script:UserDomains -join ' | '))</span></div>
     <div class="rrow"><span class="rk">Tenant ID</span><span class="rv">$(hx $Script:TenantId)</span></div>
     <div class="rrow"><span class="rk">Periodo</span><span class="rv">$($Script:StartDate.ToString('yyyy-MM-dd')) / $($Script:EndDate.ToString('yyyy-MM-dd'))</span></div>
     <div class="rrow"><span class="rk">Dias analisados</span><span class="rv">$Script:DaysBack</span></div>
@@ -3244,9 +3272,10 @@ function Get-ImpersonationHunting {
     if ($Script:SkipGraph) { Write-IRLog "Graph skipped" -Severity "INFO"; return }
 
     try {
-        Write-Host "  >> A recolher todos os utilizadores internos..." -ForegroundColor Gray
+        $domainContext = if ($Script:UserDomains.Count -gt 0) { $Script:UserDomains -join ", " } else { "todos os dominios" }
+        Write-Host "  >> A recolher utilizadores internos (dominios: $domainContext)..." -ForegroundColor Gray
 
-        # Todos os utilizadores internos
+        # Todos os utilizadores internos (todos os dominios do tenant)
         $internalUsers = @(Get-MgUser -All `
             -Property "Id,DisplayName,UserPrincipalName,UserType,Mail" `
             -Filter "userType eq 'Member'" `
@@ -3664,6 +3693,10 @@ function Get-EmailThreatAnalysis {
 
         Write-Host "  [*] $dom" -ForegroundColor DarkGray
 
+        # Dominios .onmicrosoft.com sao geridos pela Microsoft internamente
+        # DMARC/DKIM nao sao configurados pelo tenant - excluir desta analise
+        $isMsManaged = $dom -match "\.onmicrosoft\.com$"
+
         $spfValid = $false; $spfRaw   = ""
         $dmarcValid = $false; $dmarcRaw = ""; $dmarcPolicy = "none"
         $dkimStatus = "N/A"
@@ -3701,6 +3734,10 @@ function Get-EmailThreatAnalysis {
         }
 
         # --- DMARC ---
+        if ($isMsManaged) {
+            Write-IRLog "DMARC '$dom': dominio gerido pela Microsoft - analise ignorada" -Severity "INFO"
+            $dmarcValid = $true; $dmarcPolicy = "ms-managed"
+        } else {
         try {
             $dmarcResult = Resolve-DnsName -Name "_dmarc.$dom" -Type TXT -ErrorAction Stop
             $dmarcTxt    = $dmarcResult | Where-Object { $_.Strings -match "v=DMARC1" } | Select-Object -First 1
@@ -3736,9 +3773,13 @@ function Get-EmailThreatAnalysis {
             $domFactors.Add([PSCustomObject]@{Factor="DMARC nao encontrado";RiskScore=30;Severity="HIGH";Recommendation="Criar registo _dmarc.$dom TXT com v=DMARC1; p=reject"})
             Write-IRLog "DMARC nao configurado para '$dom' (+30 pts)" -Severity "HIGH" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
         }
+        } # end if -not isMsManaged (DMARC)
 
         # --- DKIM ---
-        if (Test-EXOAvailable) {
+        if ($isMsManaged) {
+            Write-IRLog "DKIM '$dom': dominio gerido pela Microsoft - analise ignorada" -Severity "INFO"
+            $dkimStatus = "MS-managed"
+        } elseif (Test-EXOAvailable) {
             try {
                 $dkimConf = Get-DkimSigningConfig -Identity $dom -ErrorAction SilentlyContinue
                 if ($dkimConf) {
@@ -3772,7 +3813,7 @@ function Get-EmailThreatAnalysis {
                 $domFactors.Add([PSCustomObject]@{Factor="DKIM nao encontrado via DNS";RiskScore=20;Severity="HIGH";Recommendation="Configurar DKIM no M365 Admin > Security > Email Auth"})
                 Write-IRLog "DKIM nao encontrado via DNS para '$dom' (+20 pts)" -Severity "HIGH" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
             } else { Write-IRLog "DKIM '$dom': $dkimStatus" -Severity "INFO" }
-        }
+        } # end elseif EXO / DNS DKIM check
 
         # --- Score por dominio ---
         if ($domFactors.Count -gt 0) {
