@@ -1,6 +1,6 @@
 # IR-O365 — Office 365 Incident Response Script
 
-**Versão actual: 4.9.2**  
+**Versão actual: 5.0.1**  
 Ferramenta de Incident Response para Microsoft 365 / Entra ID, mapeada contra a matriz [MITRE ATT&CK Enterprise — Office Suite Platform v18](https://attack.mitre.org/matrices/enterprise/cloud/officesuite/).
 
 ---
@@ -229,6 +229,7 @@ Cada execução começa com `Disconnect-MgGraph` + `Disconnect-ExchangeOnline` a
 
 | Versão | Alterações principais |
 |---|---|
+| 5.0.1 | Fix `.Count` em `$null` (Where-Object sem matches) em vários módulos - causava abort total do `Build-AttackTimeline` e de secções de Defender Alerts, OAuth Apps, Transport Rules, Send-As, Named Locations e Device Anomalies sob StrictMode; fix precedência `-and`/`-or` no gap de Legacy Auth CA; fix `continue` dentro de `ForEach-Object` (BUG_FOREACHOBJ_CONTINUE) |
 | 4.9.2 | Fix `Measure-Object .Sum` em colecção vazia (PS5.1 StrictMode) |
 | 4.9.1 | Email scoring por domínio; sumário global com pior domínio |
 | 4.9.0 | Fix `filter Add-RF` scope PS5.1; pivot entidades no report; dedup app permissions |

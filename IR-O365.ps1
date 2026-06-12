@@ -112,7 +112,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.0.0"
+$Script:Version         = "5.0.1"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -993,7 +993,9 @@ function Get-PrivilegedAccountChanges {
                         $parsed = $_ | Select-Object -ExpandProperty AuditData | ConvertFrom-Json -ErrorAction Stop
                         if ($parsed) { $audit = $parsed }
                     } catch { }
-                    if (-not $audit) { continue }
+                    # FIX BUG_FOREACHOBJ_CONTINUE: 'continue' dentro de ForEach-Object termina
+                    # toda a pipeline (nao apenas o item atual) - usar 'return' para saltar
+                    if (-not $audit) { return }
                     [PSCustomObject]@{
                         Timestamp      = $_.CreationDate
                         Operation      = $_.Operations
@@ -1150,12 +1152,12 @@ function Get-ExchangeSuspiciousActivity {
     # Transport Rules (Tenant Level)
     Write-Host "  >> Analisando transport rules do tenant..." -ForegroundColor Gray
     try {
-        $transportRules = Get-TransportRule -ErrorAction SilentlyContinue
-        $suspiciousTransport = $transportRules | Where-Object {
+        $transportRules = @(Get-TransportRule -ErrorAction SilentlyContinue)
+        $suspiciousTransport = @($transportRules | Where-Object {
             $_.BlindCopyTo -or
             $_.RedirectMessageTo -or
             $_.CopyTo
-        }
+        })
         
         if ($suspiciousTransport.Count -gt 0) {
             foreach ($rule in $suspiciousTransport) {
@@ -1198,8 +1200,8 @@ function Get-ExchangeSuspiciousActivity {
     # Send-As permissions
     Write-Host "  >> Verificando Send-As grants..." -ForegroundColor Gray
     try {
-        $sendAsPerms = Get-RecipientPermission -ResultSize Unlimited -ErrorAction SilentlyContinue |
-            Where-Object { $_.Trustee -notmatch "NT AUTHORITY|SELF" }
+        $sendAsPerms = @(Get-RecipientPermission -ResultSize Unlimited -ErrorAction SilentlyContinue |
+            Where-Object { $_.Trustee -notmatch "NT AUTHORITY|SELF" })
         
         if ($sendAsPerms.Count -gt 0) {
             Write-IRLog "Send-As permissions: $($sendAsPerms.Count) grants [T1098.002]" `
@@ -1284,8 +1286,8 @@ function Get-SuspiciousOAuthApps {
         
         $appsWithRecentCreds = [System.Collections.Generic.List[PSObject]]::new()
         foreach ($app in $apps) {
-            $recentKeys = $app.KeyCredentials | Where-Object { $_.StartDateTime -ge $Script:StartDate }
-            $recentPwds = $app.PasswordCredentials | Where-Object { $_.StartDateTime -ge $Script:StartDate }
+            $recentKeys = @($app.KeyCredentials | Where-Object { $_.StartDateTime -ge $Script:StartDate })
+            $recentPwds = @($app.PasswordCredentials | Where-Object { $_.StartDateTime -ge $Script:StartDate })
             
             if ($recentKeys -or $recentPwds) {
                 $record = [PSCustomObject]@{
@@ -2514,9 +2516,10 @@ function Get-ConditionalAccessGapAnalysis {
         # --- Gap 1: Existe policy que bloqueie Legacy Auth? ---
         Write-Host "  >> Gap: Legacy Authentication bloqueada..." -ForegroundColor Gray
         $legacyBlock = $caPolicies | Where-Object {
-            $_.State -eq "enabled" -and
-            $_.Conditions.ClientAppTypes -contains "exchangeActiveSync" -or
-            $_.Conditions.ClientAppTypes -contains "other"
+            $_.State -eq "enabled" -and (
+                $_.Conditions.ClientAppTypes -contains "exchangeActiveSync" -or
+                $_.Conditions.ClientAppTypes -contains "other"
+            )
         }
         if (-not $legacyBlock) {
             Write-IRLog "GAP: Nenhuma CA policy bloqueia Legacy Authentication - MFA bypassavel via SMTP/IMAP/POP3 [T1078]" `
@@ -2630,8 +2633,8 @@ function Get-DefenderAlerts {
             -Top 500 -ErrorAction SilentlyContinue)
 
         if ($alerts.Count -gt 0) {
-            $critAlerts = $alerts | Where-Object { $_.Severity -eq "high" -or $_.Severity -eq "critical" }
-            $medAlerts  = $alerts | Where-Object { $_.Severity -eq "medium" }
+            $critAlerts = @($alerts | Where-Object { $_.Severity -eq "high" -or $_.Severity -eq "critical" })
+            $medAlerts  = @($alerts | Where-Object { $_.Severity -eq "medium" })
 
             Write-IRLog "Defender Alerts: $($alerts.Count) total | $($critAlerts.Count) HIGH/CRITICAL | $($medAlerts.Count) MEDIUM" `
                 -Severity $(if ($critAlerts.Count -gt 0) { "HIGH" } else { "MEDIUM" }) `
@@ -3035,12 +3038,12 @@ function Get-NamedLocationsAndIPAnalysis {
             -Top 5000 -ErrorAction SilentlyContinue
 
         if ($signins) {
-            $riskyCountrySignins = $signins | Where-Object {
+            $riskyCountrySignins = @($signins | Where-Object {
                 $_.Location.CountryOrRegion -in $highRiskCountries
             } | Select-Object UserPrincipalName, CreatedDateTime, IPAddress,
                                @{N="Country";E={$_.Location.CountryOrRegion}},
                                @{N="City";E={$_.Location.City}},
-                               ClientAppUsed, DeviceDetail
+                               ClientAppUsed, DeviceDetail)
 
             if ($riskyCountrySignins.Count -gt 0) {
                 Write-IRLog "Sign-ins de paises de ALTO RISCO: $($riskyCountrySignins.Count) [T1078.004]" `
@@ -3049,13 +3052,13 @@ function Get-NamedLocationsAndIPAnalysis {
             }
 
             # Sign-ins de Tor/VPN (AS names comuns)
-            $torVpnSignins = $signins | Where-Object {
+            $torVpnSignins = @($signins | Where-Object {
                 $_.IPAddress -and (
                     $_.AuthenticationDetails.AuthenticationStepResultDetail -match "Anonymous proxy" -or
                     $_.RiskState -match "atRisk" -or
                     $_.TokenIssuerType -eq "AzureAD" -and $_.DeviceDetail.IsCompliant -eq $false
                 )
-            }
+            })
             if ($torVpnSignins.Count -gt 0) {
                 Write-IRLog "Possiveis sign-ins via Tor/Proxy Anonimo: $($torVpnSignins.Count) [T1078]" `
                     -Severity "HIGH" -MITRETechnique "T1078.004" -MITRETactic "Initial Access"
@@ -3117,9 +3120,9 @@ function Get-DeviceAnomalies {
             Export-IRData -FileName "20_new_devices_registered" -Data $newDevices
 
             # Devices pessoais (BYO) com acesso privilegiado - risco elevado
-            $byodDevices = $newDevices | Where-Object {
+            $byodDevices = @($newDevices | Where-Object {
                 $_.TrustType -eq "Workplace" -and $_.IsManaged -eq $false
-            }
+            })
             if ($byodDevices.Count -gt 0) {
                 Write-IRLog "BYOD devices nao geridos registados: $($byodDevices.Count) [T1550]" `
                     -Severity "MEDIUM" -MITRETechnique "T1550" -MITRETactic "Defense Evasion"
@@ -3563,15 +3566,15 @@ function Build-AttackTimeline {
         $techniques = $userFindings.Technique | Sort-Object -Unique
 
         # Padroes BEC (Business Email Compromise)
-        $isBEC = ($userFindings | Where-Object { $_.Technique -match "T1078|T1110" }).Count -gt 0 -and
-                 ($userFindings | Where-Object { $_.Technique -match "T1114|T1564" }).Count -gt 0
+        $isBEC = @($userFindings | Where-Object { $_.Technique -match "T1078|T1110" }).Count -gt 0 -and
+                 @($userFindings | Where-Object { $_.Technique -match "T1114|T1564" }).Count -gt 0
 
         # Padroes de Account Takeover
-        $isATO = ($userFindings | Where-Object { $_.Technique -match "T1078|T1110" }).Count -gt 0 -and
-                 ($userFindings | Where-Object { $_.Technique -match "T1098|T1531" }).Count -gt 0
+        $isATO = @($userFindings | Where-Object { $_.Technique -match "T1078|T1110" }).Count -gt 0 -and
+                 @($userFindings | Where-Object { $_.Technique -match "T1098|T1531" }).Count -gt 0
 
         # Padroes de Exfiltracao
-        $isExfil = ($userFindings | Where-Object { $_.Technique -match "T1530|T1048|T1567|T1114" }).Count -gt 0
+        $isExfil = @($userFindings | Where-Object { $_.Technique -match "T1530|T1048|T1567|T1114" }).Count -gt 0
 
         $attackPattern = @()
         if ($isBEC)   { $attackPattern += "BEC (Business Email Compromise)" }
@@ -3582,8 +3585,8 @@ function Build-AttackTimeline {
         $record = [PSCustomObject]@{
             User            = $user
             FindingsCount   = $userFindings.Count
-            CriticalCount   = ($userFindings | Where-Object { $_.Severity -eq "CRITICAL" }).Count
-            HighCount       = ($userFindings | Where-Object { $_.Severity -eq "HIGH" }).Count
+            CriticalCount   = @($userFindings | Where-Object { $_.Severity -eq "CRITICAL" }).Count
+            HighCount       = @($userFindings | Where-Object { $_.Severity -eq "HIGH" }).Count
             TacticsObserved = $tactics -join " >> "
             TechniquesUsed  = $techniques -join ";"
             AttackPattern   = $attackPattern -join " + "
