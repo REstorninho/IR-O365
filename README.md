@@ -1,6 +1,6 @@
 # IR-O365 — Office 365 Incident Response Script
 
-**Versão actual: 5.2.0**  
+**Versão actual: 5.3.0**  
 Ferramenta de Incident Response para Microsoft 365 / Entra ID, mapeada contra a matriz [MITRE ATT&CK Enterprise — Office Suite Platform v18](https://attack.mitre.org/matrices/enterprise/cloud/officesuite/).
 
 ---
@@ -230,6 +230,7 @@ Cada execução começa com `Disconnect-MgGraph` + `Disconnect-ExchangeOnline` a
 
 | Versão | Alterações principais |
 |---|---|
+| 5.3.0 | Novo check no módulo 05 `Get-ExchangeSuspiciousActivity`: deteção de Mailbox Audit Bypass / Audit Disabled (T1562.008) via `AuditEnabled=$false` (HIGH) e `Get-MailboxAuditBypassAssociation` com `AuditBypassEnabled=$true` (CRITICAL), exportado para `04_mailbox_audit_bypass.csv`; novo check no módulo 03 `Get-MFAStatus`: deteção de novos registos de métodos de autenticação via UAL (`Admin/User registered security info`) - admin a registar MFA para outro utilizador é HIGH (T1098.002), auto-registo por utilizador em watchlist é MEDIUM (T1556.006), exportado para `02_auth_method_registrations.csv`; fix `BUG_PARALLEL_EMPTY` em `Invoke-IRParallelForEach` - parâmetro `InputObject` deixou de ser `Mandatory` (rejeitava `@()` na ligação de parâmetros antes do guard de coleção vazia correr, abortando todo o módulo 03 quando não havia membros de roles privilegiadas) |
 | 5.2.0 | Novo helper `Invoke-IRParallelForEach`: paraleliza (PS7+, `ForEach-Object -Parallel`, fallback sequencial em PS5.1) o loop de verificação de MFA por admin no módulo 03 (até 3 chamadas Graph por utilizador) - reduz significativamente o tempo deste módulo em tenants com muitos admins, sem alterar findings/CSV gerados |
 | 5.1.0 | Novo módulo 25 `Get-MailboxAccessForensics` (T1114.002, T1213) - correlaciona eventos `MailItemsAccessed`/`Send`/`SearchQueryInitiated` do Advanced Audit (requer E5) para utilizadores já marcados como CRITICAL/HIGH ou em watchlist, identificando acesso a mailbox, envio por terceiros (SendAs/SendOnBehalf) e pesquisas suspeitas pós-compromisso; novo helper `Get-JsonProperty` para acesso seguro a propriedades JSON variáveis sob StrictMode |
 | 5.0.1 | Fix `.Count` em `$null` (Where-Object sem matches) em vários módulos - causava abort total do `Build-AttackTimeline` e de secções de Defender Alerts, OAuth Apps, Transport Rules, Send-As, Named Locations e Device Anomalies sob StrictMode; fix precedência `-and`/`-or` no gap de Legacy Auth CA; fix `continue` dentro de `ForEach-Object` (BUG_FOREACHOBJ_CONTINUE) |

@@ -112,7 +112,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.2.0"
+$Script:Version         = "5.3.0"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -291,10 +291,13 @@ function Get-JsonProperty {
 # O caller deve processar os resultados devolvidos sequencialmente.
 function Invoke-IRParallelForEach {
     param(
-        [Parameter(Mandatory)] [array]$InputObject,
+        [array]$InputObject = @(),
         [Parameter(Mandatory)] [scriptblock]$ScriptBlock,
         [int]$ThrottleLimit = 5
     )
+    # FIX BUG_PARALLEL_EMPTY: parametro Mandatory rejeita @() na ligacao de
+    # parametros (antes do corpo da funcao correr) - tem de ser opcional para
+    # este guard funcionar quando o caller passa uma colecao vazia.
     if (-not $InputObject -or $InputObject.Count -eq 0) { return @() }
 
     if ($PSVersionTable.PSVersion.Major -ge 7 -and $InputObject.Count -gt 1) {
@@ -1002,7 +1005,54 @@ function Get-MFAStatus {
                 -Severity "MEDIUM" -MITRETechnique "T1562.008" -MITRETactic "Defense Evasion"
             Export-IRData -FileName "02_ca_disabled_policies" -Data ($disabledPolicies | Select-Object DisplayName, State, CreatedDateTime, ModifiedDateTime)
         }
-        
+
+        # Novos metodos de autenticacao registados (T1556.006/T1098.002 - backdoor MFA)
+        # Um atacante com sessao/token roubado regista o seu proprio Authenticator/telefone
+        # para manter acesso mesmo apos reset de password. "Admin registered security info"
+        # com Actor != Target e um indicador forte de persistencia via delegacao.
+        Write-Host "  >> Verificando registo de novos metodos de autenticacao (UAL)..." -ForegroundColor Gray
+        if (-not $Script:SkipUAL) {
+            try {
+                $authRegEvents = Invoke-UALSearch `
+                    -StartDate $Script:StartDate -EndDate $Script:EndDate `
+                    -Operations @("Admin registered security info", "User registered security info", "User registered all required security info") `
+                    -RecordType "AzureActiveDirectory" -ResultSize 1000 -ErrorAction SilentlyContinue
+
+                $authRegResults = [System.Collections.Generic.List[PSObject]]::new()
+                foreach ($ev in $authRegEvents) {
+                    $audit = $null
+                    try { $audit = $ev.AuditData | ConvertFrom-Json } catch { continue }
+
+                    $targetEntry = @(Get-JsonProperty $audit "Target" @()) | Where-Object { (Get-JsonProperty $_ "Type" -1) -eq 0 } | Select-Object -First 1
+                    $targetUpn   = if ($targetEntry) { Get-JsonProperty $targetEntry "ID" $ev.UserIds } else { $ev.UserIds }
+
+                    $actorEntry  = @(Get-JsonProperty $audit "Actor" @()) | Where-Object { (Get-JsonProperty $_ "Type" -1) -eq 0 } | Select-Object -First 1
+                    $actorUpn    = if ($actorEntry) { Get-JsonProperty $actorEntry "ID" $ev.UserIds } else { $ev.UserIds }
+
+                    $record = [PSCustomObject]@{
+                        Timestamp = $ev.CreationDate
+                        Operation = $ev.Operations
+                        Actor     = $actorUpn
+                        Target    = $targetUpn
+                    }
+                    $authRegResults.Add($record)
+
+                    if ($ev.Operations -eq "Admin registered security info" -and $actorUpn -and $targetUpn -and ($actorUpn -ne $targetUpn)) {
+                        Write-IRLog "Metodo de autenticacao registado por ADMIN para outro utilizador: $actorUpn >> $targetUpn [T1098.002]" `
+                            -Severity "HIGH" -MITRETechnique "T1098.002" -MITRETactic "Persistence" -Data $record
+                    } elseif ($Script:WatchlistUsers -contains $targetUpn) {
+                        Write-IRLog "Novo metodo de autenticacao registado (utilizador em watchlist): $targetUpn [T1556.006]" `
+                            -Severity "MEDIUM" -MITRETechnique "T1556.006" -MITRETactic "Persistence" -Data $record
+                    }
+                }
+
+                if ($authRegResults.Count -gt 0) {
+                    Write-IRLog "Registos de metodos de autenticacao no periodo: $($authRegResults.Count)" -Severity "INFO"
+                    Export-IRData -FileName "02_auth_method_registrations" -Data $authRegResults
+                }
+            } catch { Write-IRLog "Erro ao verificar registo de metodos de autenticacao: $_" -Severity "INFO" }
+        }
+
     } catch {
         Write-IRLog "Erro no modulo MFA: $_" -Severity "INFO"
     }
@@ -1172,9 +1222,42 @@ function Get-ExchangeSuspiciousActivity {
             }
         }
         Export-IRData -FileName "04_suspicious_inbox_rules" -Data $suspiciousRules
-        
+
     } catch { Write-IRLog "Erro ao verificar inbox rules: $_" -Severity "INFO" }
-    
+
+    # Mailbox Audit Bypass / Audit Disabled (T1562.008 - Disable/Modify Logging)
+    Write-Host "  >> Verificando bypass de mailbox audit logging..." -ForegroundColor Gray
+    try {
+        $auditIssues = [System.Collections.Generic.List[PSObject]]::new()
+
+        $auditDisabled = @($allMailboxes | Where-Object { $_.AuditEnabled -eq $false })
+        foreach ($mbx in $auditDisabled) {
+            $record = [PSCustomObject]@{
+                Mailbox = $mbx.UserPrincipalName
+                Issue   = "AuditEnabled=False"
+            }
+            $auditIssues.Add($record)
+            Write-IRLog "Mailbox audit DESATIVADO: $($mbx.UserPrincipalName) [T1562.008]" `
+                -Severity "HIGH" -MITRETechnique "T1562.008" -MITRETactic "Defense Evasion" -Data $record
+        }
+
+        $bypassAssoc = @(Get-MailboxAuditBypassAssociation -ResultSize Unlimited -ErrorAction SilentlyContinue |
+            Where-Object { $_.AuditBypassEnabled -eq $true })
+        foreach ($ba in $bypassAssoc) {
+            $record = [PSCustomObject]@{
+                Mailbox = $ba.Name
+                Issue   = "AuditBypassEnabled=True"
+            }
+            $auditIssues.Add($record)
+            Write-IRLog "Mailbox audit BYPASS activo: $($ba.Name) - acoes deste utilizador nao sao registadas em nenhuma mailbox [T1562.008]" `
+                -Severity "CRITICAL" -MITRETechnique "T1562.008" -MITRETactic "Defense Evasion" -Data $record
+        }
+
+        if ($auditIssues.Count -gt 0) {
+            Export-IRData -FileName "04_mailbox_audit_bypass" -Data $auditIssues
+        }
+    } catch { Write-IRLog "Erro ao verificar mailbox audit bypass: $_" -Severity "INFO" }
+
     # External Mail Forwarding (Mailbox level)
     # FIX BUG_FWD_FALSEPOS: filtrar forwardings internos ao mesmo dominio
     Write-Host "  >> Verificando forwarding externo ao nivel do mailbox..." -ForegroundColor Gray
