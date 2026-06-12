@@ -112,7 +112,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.0.1"
+$Script:Version         = "5.1.0"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -266,6 +266,17 @@ function Export-IRData {
     } catch {
         Write-IRLog "Erro ao exportar $FileName`: $_" -Severity "INFO"
     }
+}
+
+# FIX BUG_JSON_PROPNOTFOUND: ConvertFrom-Json devolve objetos cujo schema varia por
+# tipo de evento de auditoria. Sob StrictMode, aceder a uma propriedade inexistente
+# (ex: $audit.Folders quando o registo nao tem Folders) lanca PropertyNotFoundException.
+# Este helper faz acesso seguro, devolvendo $Default se a propriedade nao existir.
+function Get-JsonProperty {
+    param([object]$Object, [string]$Name, $Default = $null)
+    if ($null -eq $Object) { return $Default }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($prop) { return $prop.Value } else { return $Default }
 }
 
 # FIX BUG_UAL_NULL: Invoke-UALSearch retorna $null (nao array vazio)
@@ -1439,6 +1450,171 @@ function Get-CriticalAuditEvents {
             }
         }
     } catch { Write-IRLog "Bulk download analysis: $_" -Severity "INFO" }
+}
+
+# ============================================================
+# MODULO 27: MAILBOX ACCESS FORENSICS (T1114.002/T1213)
+# ============================================================
+
+function Get-MailboxAccessForensics {
+    # T1114.002 - Remote Email Collection | T1213 - Data from Information Repositories
+    # Correlaciona MailItemsAccessed/Send/SearchQueryInitiated (M365 Advanced Audit, requer E5)
+    # com utilizadores ja identificados como CRITICAL/HIGH ou em watchlist - para
+    # responder a "o que foi exfiltrado/lido/enviado depois do compromisso?"
+    Write-Section "MAILBOX ACCESS FORENSICS (MailItemsAccessed/Send)" "T1114.002/T1213" "Collection"
+
+    if ($Script:SkipUAL) { Write-IRLog "UAL skipped por parametro" -Severity "INFO"; return }
+
+    if (-not (Test-UALAvailable)) {
+        Write-IRLog "Search-UnifiedAuditLog indisponivel - requer Exchange Online conectado" -Severity "HIGH"
+        return
+    }
+
+    try {
+        # ---- Utilizadores de interesse: findings CRITICAL/HIGH + watchlist ----
+        $focusUsers = [System.Collections.Generic.List[string]]::new()
+        foreach ($f in $Script:Findings) {
+            if ($f.Severity -notin @("CRITICAL","HIGH")) { continue }
+            [regex]::Matches($f.Message, '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}') | ForEach-Object {
+                if ($focusUsers -notcontains $_.Value) { $focusUsers.Add($_.Value) }
+            }
+        }
+        foreach ($wu in $Script:WatchlistUsers) {
+            if ($focusUsers -notcontains $wu) { $focusUsers.Add($wu) }
+        }
+
+        if ($focusUsers.Count -eq 0) {
+            Write-IRLog "Mailbox Access Forensics: sem utilizadores de interesse (sem findings CRITICAL/HIGH nem watchlist) - modulo ignorado" -Severity "INFO"
+            return
+        }
+
+        Write-Host "  >> A correlacionar acesso a mailboxes para $($focusUsers.Count) utilizador(es) de interesse..." -ForegroundColor Gray
+
+        # ---- MailItemsAccessed: leitura/sincronizacao de email apos compromisso ----
+        $accessEvents = Invoke-UALSearch `
+            -StartDate $Script:StartDate -EndDate $Script:EndDate `
+            -Operations @("MailItemsAccessed") -ResultSize 5000 -ErrorAction SilentlyContinue
+
+        if ($accessEvents.Count -eq 0) {
+            Write-IRLog "MailItemsAccessed: sem eventos no periodo (requer M365 Advanced Audit / licenca E5)" -Severity "INFO"
+        } else {
+            $accessParsed = foreach ($ev in $accessEvents) {
+                try { $audit = $ev.AuditData | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+
+                $owner = Get-JsonProperty $audit "MailboxOwnerUPN"
+                if (-not $owner -or $owner -notin $focusUsers) { continue }
+
+                $accessType  = "Unknown"
+                $isThrottled = $false
+                foreach ($p in (Get-JsonProperty $audit "OperationProperties" @())) {
+                    $pName  = Get-JsonProperty $p "Name"
+                    $pValue = Get-JsonProperty $p "Value"
+                    if ($pName -eq "MailAccessType") { $accessType  = $pValue }
+                    if ($pName -eq "IsThrottled")    { $isThrottled = $pValue }
+                }
+
+                $itemCount = 0
+                foreach ($folder in (Get-JsonProperty $audit "Folders" @())) {
+                    $itemCount += @(Get-JsonProperty $folder "FolderItems" @()).Count
+                }
+
+                [PSCustomObject]@{
+                    Timestamp     = $ev.CreationDate
+                    MailboxOwner  = $owner
+                    AccessedBy    = Get-JsonProperty $audit "UserId"
+                    ClientIP      = Get-JsonProperty $audit "ClientIPAddress"
+                    AccessType    = $accessType
+                    IsThrottled   = $isThrottled
+                    ItemsAccessed = $itemCount
+                }
+            }
+
+            if ($accessParsed) {
+                Export-IRData -FileName "27_mailbox_access_focus_users" -Data $accessParsed
+
+                foreach ($ug in ($accessParsed | Group-Object MailboxOwner)) {
+                    $syncEvents = @($ug.Group | Where-Object { $_.AccessType -eq "Sync" })
+                    $totalItems = ($ug.Group | Measure-Object -Property ItemsAccessed -Sum).Sum
+                    $uniqueIPs  = @($ug.Group.ClientIP | Sort-Object -Unique)
+                    $thirdParty = @($ug.Group | Where-Object { $_.AccessedBy -and $_.AccessedBy -ne $ug.Name })
+
+                    $sev = if ($thirdParty.Count -gt 0 -or $syncEvents.Count -gt 5) { "CRITICAL" } else { "HIGH" }
+                    Write-IRLog "Mailbox Access: '$($ug.Name)' >> $($ug.Count) acessos (Sync=$($syncEvents.Count), itens=$totalItems, IPs=$($uniqueIPs.Count), acesso-3os=$($thirdParty.Count)) [T1114.002]" `
+                        -Severity $sev -MITRETechnique "T1114.002" -MITRETactic "Collection" -Data $ug.Group
+                }
+            }
+        }
+
+        # ---- Send/SendAs por terceiros - indicador forte de BEC ----
+        Write-Host "  >> A verificar envios de email em nome de outro utilizador (SendAs/SendOnBehalf)..." -ForegroundColor Gray
+        $sendEvents = Invoke-UALSearch `
+            -StartDate $Script:StartDate -EndDate $Script:EndDate `
+            -Operations @("Send") -ResultSize 3000 -ErrorAction SilentlyContinue
+
+        if ($sendEvents.Count -eq 0) {
+            Write-IRLog "Send: sem eventos no periodo (requer M365 Advanced Audit / licenca E5)" -Severity "INFO"
+        } else {
+            $sendThirdParty = foreach ($ev in $sendEvents) {
+                try { $audit = $ev.AuditData | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+
+                $owner = Get-JsonProperty $audit "MailboxOwnerUPN"
+                $actor = Get-JsonProperty $audit "UserId"
+                if (-not $owner -or -not $actor) { continue }
+                if ($actor -eq $owner) { continue }
+                if ($actor -match "^S-1-|^NT AUTHORITY") { continue }
+
+                $item = Get-JsonProperty $audit "Item"
+                [PSCustomObject]@{
+                    Timestamp = $ev.CreationDate
+                    Mailbox   = $owner
+                    SentBy    = $actor
+                    ClientIP  = Get-JsonProperty $audit "ClientIPAddress"
+                    Subject   = Get-JsonProperty $item "Subject"
+                }
+            }
+
+            if ($sendThirdParty) {
+                Export-IRData -FileName "27_mailbox_send_thirdparty" -Data $sendThirdParty
+                foreach ($sg in ($sendThirdParty | Group-Object Mailbox)) {
+                    $sev = if ($sg.Name -in $focusUsers) { "CRITICAL" } else { "MEDIUM" }
+                    Write-IRLog "Email enviado em nome de outro utilizador: '$($sg.Name)' <- $($sg.Count) email(s) por terceiros [T1114.002/T1098.002]" `
+                        -Severity $sev -MITRETechnique "T1114.002" -MITRETactic "Collection" -Data $sg.Group
+                }
+            }
+        }
+
+        # ---- SearchQueryInitiated - reconhecimento dentro da mailbox comprometida ----
+        Write-Host "  >> A verificar pesquisas dentro de mailboxes de interesse (reconhecimento)..." -ForegroundColor Gray
+        $searchEvents = Invoke-UALSearch `
+            -StartDate $Script:StartDate -EndDate $Script:EndDate `
+            -Operations @("SearchQueryInitiated") -ResultSize 2000 -ErrorAction SilentlyContinue
+
+        if ($searchEvents.Count -gt 0) {
+            $searchParsed = foreach ($ev in $searchEvents) {
+                try { $audit = $ev.AuditData | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+
+                $owner = Get-JsonProperty $audit "MailboxOwnerUPN"
+                if (-not $owner -or $owner -notin $focusUsers) { continue }
+
+                [PSCustomObject]@{
+                    Timestamp    = $ev.CreationDate
+                    MailboxOwner = $owner
+                    SearchedBy   = Get-JsonProperty $audit "UserId"
+                    Query        = Get-JsonProperty $audit "SearchQuery"
+                }
+            }
+
+            if ($searchParsed) {
+                $searchParsed = @($searchParsed)
+                Export-IRData -FileName "27_mailbox_search_queries" -Data $searchParsed
+                Write-IRLog "Pesquisas dentro de mailbox de utilizadores de interesse: $($searchParsed.Count) [T1213]" `
+                    -Severity "MEDIUM" -MITRETechnique "T1213" -MITRETactic "Collection" -Data $searchParsed
+            }
+        }
+
+    } catch {
+        Write-DebugError "MailboxAccessForensics" "Erro no modulo" $_
+    }
 }
 
 # ============================================================
@@ -3918,7 +4094,7 @@ function Start-O365IRScriptFull {
     Connect-IRServices
 
     Write-Host ""
-    Write-Host "  Iniciando analise IR completa (23 modulos)..." -ForegroundColor Cyan
+    Write-Host "  Iniciando analise IR completa (26 modulos)..." -ForegroundColor Cyan
 
     # Modulos base
     $Script:_modules = @(
@@ -3931,7 +4107,7 @@ function Start-O365IRScriptFull {
         "Get-ExfiltrationCorrelation","Get-NamedLocationsAndIPAnalysis","Get-DeviceAnomalies",
         "Get-FederationAndExternalIdentityAudit","Get-EmailThreatAnalysis",
         "Get-MFAFatigueHunting","Get-ImpersonationHunting","Get-EnumerationHunting",
-        "Build-AttackTimeline"
+        "Get-MailboxAccessForensics","Build-AttackTimeline"
     )
     foreach ($mod in $Script:_modules) {
         Start-ModuleTimer $mod

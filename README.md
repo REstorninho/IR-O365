@@ -1,6 +1,6 @@
 # IR-O365 — Office 365 Incident Response Script
 
-**Versão actual: 5.0.1**  
+**Versão actual: 5.1.0**  
 Ferramenta de Incident Response para Microsoft 365 / Entra ID, mapeada contra a matriz [MITRE ATT&CK Enterprise — Office Suite Platform v18](https://attack.mitre.org/matrices/enterprise/cloud/officesuite/).
 
 ---
@@ -123,7 +123,8 @@ O path do report HTML é apresentado como `file:///C:/...` — copiar e colar di
 | 22 | MFA Fatigue | Push bombing (T1621), Device Code phishing | T1621 |
 | 23 | Impersonation | Display name spoofing, consent phishing refinado | T1656, T1550.001 |
 | 24 | Enumeration | Reconhecimento via Graph API, password policy | T1526, T1087, T1201 |
-| 25 | Attack Timeline | Correlação cross-finding, padrões BEC/ATO | todos |
+| 25 | Mailbox Access Forensics | MailItemsAccessed/Send/SearchQueryInitiated para utilizadores em risco (requer E5) | T1114.002, T1213 |
+| 26 | Attack Timeline | Correlação cross-finding, padrões BEC/ATO | todos |
 
 ---
 
@@ -229,6 +230,7 @@ Cada execução começa com `Disconnect-MgGraph` + `Disconnect-ExchangeOnline` a
 
 | Versão | Alterações principais |
 |---|---|
+| 5.1.0 | Novo módulo 25 `Get-MailboxAccessForensics` (T1114.002, T1213) - correlaciona eventos `MailItemsAccessed`/`Send`/`SearchQueryInitiated` do Advanced Audit (requer E5) para utilizadores já marcados como CRITICAL/HIGH ou em watchlist, identificando acesso a mailbox, envio por terceiros (SendAs/SendOnBehalf) e pesquisas suspeitas pós-compromisso; novo helper `Get-JsonProperty` para acesso seguro a propriedades JSON variáveis sob StrictMode |
 | 5.0.1 | Fix `.Count` em `$null` (Where-Object sem matches) em vários módulos - causava abort total do `Build-AttackTimeline` e de secções de Defender Alerts, OAuth Apps, Transport Rules, Send-As, Named Locations e Device Anomalies sob StrictMode; fix precedência `-and`/`-or` no gap de Legacy Auth CA; fix `continue` dentro de `ForEach-Object` (BUG_FOREACHOBJ_CONTINUE) |
 | 4.9.2 | Fix `Measure-Object .Sum` em colecção vazia (PS5.1 StrictMode) |
 | 4.9.1 | Email scoring por domínio; sumário global com pior domínio |
