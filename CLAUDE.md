@@ -43,11 +43,11 @@ The file is organized into clearly marked `# ====...====` regions, in this order
    `Import-Module` of Graph sub-modules.
 3. **Core helper functions** — `Write-IRLog`, `Write-DebugError`,
    `Start-ModuleTimer` / `Stop-ModuleTimer`, `Write-Section`, `Export-IRData`,
-   `Invoke-UALSearch`, `New-OutputDirectory`, `Test-EXOAvailable`,
-   `Test-UALAvailable`.
+   `Get-JsonProperty`, `Invoke-IRParallelForEach`, `Invoke-UALSearch`,
+   `New-OutputDirectory`, `Test-EXOAvailable`, `Test-UALAvailable`.
 4. **Banner & prerequisites** — `Show-Banner`, `Test-Prerequisites`.
 5. **Authentication** — `Connect-IRServices`, `Close-IRSessions`.
-6. **Modules 1–25** — each `Get-*` / `Build-*` function is one numbered IR module
+6. **Modules 1–26** — each `Get-*` / `Build-*` function is one numbered IR module
    (see README's "Módulos de análise" table for the canonical list and MITRE
    mapping). Modules are separated by `# ====...====` region comment blocks
    numbered "MODULO N: ...".
@@ -116,6 +116,34 @@ landmines that have been fixed before and must not be reintroduced:
   `$Script:SkipUAL`.
 - Respect `$Script:SkipExchange`, `$Script:SkipGraph`, `$Script:SkipUAL` —
   modules should no-op (or skip the relevant sub-section) when these are set.
+
+### Parallelizing heavy per-item Graph loops
+
+`Invoke-IRParallelForEach` (defined near `Get-JsonProperty`) parallelizes loops that
+make one (or a few) Microsoft Graph calls per item: on PS7+ it uses
+`ForEach-Object -ThrottleLimit N -Parallel`, relying on the fact that the
+Microsoft.Graph SDK's authentication context (`GraphSession`) is process-wide static
+state, so parallel runspaces reuse the session set up by the initial
+`Connect-MgGraph` — no per-thread reconnect needed. On PS5.1, or if `-Parallel`
+throws, it falls back to a plain sequential `ForEach-Object`. See `Get-MFAStatus`
+(module 03, admin MFA check) for the reference usage.
+
+Rules when using it:
+- The `-ScriptBlock` must be **read-only** (`Get-Mg*` calls) and return plain data
+  objects (e.g. `[PSCustomObject]`). **Never** call `Write-IRLog`/`Write-DebugError`
+  or mutate `$Script:*` state from inside the scriptblock — shared mutable state is
+  not thread-safe across parallel runspaces.
+- If a per-item Graph call can fail, catch it inside the scriptblock and return the
+  error message as a string field (e.g. `DebugMsgs`); the caller then calls
+  `Write-DebugError`/`Write-IRLog` sequentially over the returned results.
+- Add `Import-Module Microsoft.Graph.<SubModule> -ErrorAction SilentlyContinue` at
+  the top of the scriptblock for any Graph submodules it calls, so cmdlets resolve
+  reliably in the new runspace.
+- **Do not** use this for Exchange Online (EXO) cmdlets (`Get-InboxRule`,
+  `Get-MailboxPermission`, etc.) — EXO's implicit-remoting session is tied to the
+  runspace that ran `Connect-ExchangeOnline` and does not carry over to parallel
+  runspaces, and the script's interactive/device-code auth can't be silently
+  re-run per thread.
 
 ### Language / tone
 - Log messages, comments, and README are written in **Portuguese (PT-PT)**.

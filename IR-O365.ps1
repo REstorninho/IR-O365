@@ -112,7 +112,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.0.1"
+$Script:Version         = "5.3.0"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -266,6 +266,48 @@ function Export-IRData {
     } catch {
         Write-IRLog "Erro ao exportar $FileName`: $_" -Severity "INFO"
     }
+}
+
+# FIX BUG_JSON_PROPNOTFOUND: ConvertFrom-Json devolve objetos cujo schema varia por
+# tipo de evento de auditoria. Sob StrictMode, aceder a uma propriedade inexistente
+# (ex: $audit.Folders quando o registo nao tem Folders) lanca PropertyNotFoundException.
+# Este helper faz acesso seguro, devolvendo $Default se a propriedade nao existir.
+function Get-JsonProperty {
+    param([object]$Object, [string]$Name, $Default = $null)
+    if ($null -eq $Object) { return $Default }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($prop) { return $prop.Value } else { return $Default }
+}
+
+# FIX BUG_PARALLEL_GRAPH: paraleliza loops de leitura Microsoft Graph (1 chamada por
+# item) em PS7+ via 'ForEach-Object -Parallel'. O contexto de autenticacao do SDK
+# Microsoft.Graph (GraphSession) e' estado estatico partilhado pelo processo, por isso
+# os runspaces paralelos reutilizam a sessao ja autenticada pelo Connect-MgGraph inicial
+# - nao e' necessario reconectar. Em PS5.1 (ou se -Parallel falhar) cai para sequencial.
+#
+# IMPORTANTE: $ScriptBlock deve ser SOMENTE LEITURA (chamadas Get-Mg*) e devolver
+# objetos simples. NUNCA chamar Write-IRLog/Write-DebugError ou modificar $Script:*
+# dentro do ScriptBlock - estado partilhado (listas, contadores) nao e' thread-safe.
+# O caller deve processar os resultados devolvidos sequencialmente.
+function Invoke-IRParallelForEach {
+    param(
+        [array]$InputObject = @(),
+        [Parameter(Mandatory)] [scriptblock]$ScriptBlock,
+        [int]$ThrottleLimit = 5
+    )
+    # FIX BUG_PARALLEL_EMPTY: parametro Mandatory rejeita @() na ligacao de
+    # parametros (antes do corpo da funcao correr) - tem de ser opcional para
+    # este guard funcionar quando o caller passa uma colecao vazia.
+    if (-not $InputObject -or $InputObject.Count -eq 0) { return @() }
+
+    if ($PSVersionTable.PSVersion.Major -ge 7 -and $InputObject.Count -gt 1) {
+        try {
+            return @($InputObject | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel $ScriptBlock)
+        } catch {
+            Write-DebugError "Parallel" "ForEach-Object -Parallel falhou, a usar modo sequencial" $_
+        }
+    }
+    return @($InputObject | ForEach-Object -Process $ScriptBlock)
 }
 
 # FIX BUG_UAL_NULL: Invoke-UALSearch retorna $null (nao array vazio)
@@ -809,6 +851,8 @@ function Get-MFAStatus {
         
         $adminsMFAResults = [System.Collections.Generic.List[PSObject]]::new()
 
+        # Recolher membros de todas as roles privilegiadas (1 chamada Graph por role)
+        $memberTasks = [System.Collections.Generic.List[PSObject]]::new()
         foreach ($roleId in $privilegedRoles) {
             try {
                 $roleMembers = @()
@@ -829,83 +873,115 @@ function Get-MFAStatus {
 
                 foreach ($member in $roleMembers) {
                     if ($member.AdditionalProperties["@odata.type"] -ne "#microsoft.graph.user") { continue }
-                    $uid = $member.Id
-                    $upn = $member.AdditionalProperties["userPrincipalName"]
-
-                    # --- Metodo 1: Get-MgUserAuthenticationMethod (requer UserAuthenticationMethod.Read.All)
-                    $hasMFA    = $false
-                    $mfaMethods= @()
-                    $methodSrc = "N/A"
-                    try {
-                        $authMethods = @(Get-MgUserAuthenticationMethod -UserId $uid -ErrorAction Stop)
-                        $mfaTypes = @(
-                            "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod",
-                            "#microsoft.graph.phoneAuthenticationMethod",
-                            "#microsoft.graph.fido2AuthenticationMethod",
-                            "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod",
-                            "#microsoft.graph.softwareOathAuthenticationMethod",
-                            "#microsoft.graph.temporaryAccessPassAuthenticationMethod"
-                        )
-                        $mfaMethods = @($authMethods | Where-Object {
-                            $_.AdditionalProperties["@odata.type"] -in $mfaTypes
-                        })
-                        $hasMFA    = $mfaMethods.Count -gt 0
-                        $methodSrc = "AuthenticationMethod API"
-                        Write-DebugError "MFAStatus" "User $upn - $($authMethods.Count) methods found, $($mfaMethods.Count) MFA" $null
-                    } catch {
-                        Write-DebugError "MFAStatus" "AuthMethod API falhou para $upn" $_
-                    }
-
-                    # --- Metodo 2 (fallback): verificar via User StrongAuthenticationRequirements (MSOL-style via Graph)
-                    if (-not $hasMFA -and $methodSrc -eq "N/A") {
-                        try {
-                            $userDetail = Get-MgUser -UserId $uid `
-                                -Property "Id,UserPrincipalName,StrongAuthenticationDetail" `
-                                -ErrorAction SilentlyContinue
-                            if ($userDetail -and $userDetail.AdditionalProperties.ContainsKey("strongAuthenticationDetail")) {
-                                $sad = $userDetail.AdditionalProperties["strongAuthenticationDetail"]
-                                if ($sad -and $sad.methods -and $sad.methods.Count -gt 0) {
-                                    $hasMFA    = $true
-                                    $methodSrc = "StrongAuthDetail"
-                                }
-                            }
-                        } catch { Write-DebugError "MFAStatus" "StrongAuth check $upn" $_ }
-                    }
-
-                    # --- Metodo 3 (fallback): verificar via Reports API - per-user MFA state
-                    if (-not $hasMFA -and $methodSrc -eq "N/A") {
-                        try {
-                            $regDetail = Get-MgReportAuthenticationMethodUserRegistrationDetail `
-                                -UserRegistrationDetailsId $uid -ErrorAction Stop
-                            if ($regDetail) {
-                                $hasMFA    = $regDetail.IsMfaRegistered -or $regDetail.IsMfaCapable
-                                $methodSrc = "RegistrationDetail (isMfaRegistered=$($regDetail.IsMfaRegistered))"
-                            }
-                        } catch { Write-DebugError "MFAStatus" "RegistrationDetail $upn" $_ }
-                    }
-
-                    $record = [PSCustomObject]@{
-                        UserId        = $uid
-                        UPN           = $upn
-                        RoleId        = $roleId
-                        MFAConfigured = $hasMFA
-                        MethodCount   = $mfaMethods.Count
-                        DetectionSrc  = $methodSrc
-                    }
-                    $adminsMFAResults.Add($record)
-
-                    if (-not $hasMFA -and $methodSrc -ne "N/A") {
-                        # So reportar como sem MFA se conseguimos verificar E nao tem
-                        Write-IRLog "ADMIN SEM MFA VERIFICADO: $upn (via $methodSrc) [T1556.006]" `
-                            -Severity "CRITICAL" -MITRETechnique "T1556.006" -MITRETactic "Defense Evasion" -Data $record
-                    } elseif ($methodSrc -eq "N/A") {
-                        Write-IRLog "MFA nao verificavel para $upn - scope UserAuthenticationMethod.Read.All pode estar em falta" `
-                            -Severity "INFO"
-                    } else {
-                        Write-IRLog "Admin com MFA: $upn ($methodSrc)" -Severity "INFO"
-                    }
+                    $memberTasks.Add([PSCustomObject]@{
+                        UserId = $member.Id
+                        UPN    = $member.AdditionalProperties["userPrincipalName"]
+                        RoleId = $roleId
+                    })
                 }
             } catch { Write-DebugError "MFAStatus" "Role loop $roleId" $_ }
+        }
+
+        # FIX BUG_PARALLEL_MFA: verificacao de MFA por admin (1-3 chamadas Graph cada) e'
+        # o loop mais lento deste modulo. Em PS7+ corre em paralelo via
+        # Invoke-IRParallelForEach; o scriptblock e' so-leitura e devolve objetos que
+        # sao processados (logging, $Script:Findings) sequencialmente a seguir.
+        $mfaCheckScript = {
+            $task = $_
+            $mfaTypes = @(
+                "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod",
+                "#microsoft.graph.phoneAuthenticationMethod",
+                "#microsoft.graph.fido2AuthenticationMethod",
+                "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod",
+                "#microsoft.graph.softwareOathAuthenticationMethod",
+                "#microsoft.graph.temporaryAccessPassAuthenticationMethod"
+            )
+            Import-Module Microsoft.Graph.Identity.SignIns, Microsoft.Graph.Users, Microsoft.Graph.Reports -ErrorAction SilentlyContinue
+
+            $uid = $task.UserId
+            $upn = $task.UPN
+            $hasMFA     = $false
+            $mfaMethods = @()
+            $methodSrc  = "N/A"
+            $debugMsgs  = [System.Collections.Generic.List[string]]::new()
+
+            # --- Metodo 1: Get-MgUserAuthenticationMethod (requer UserAuthenticationMethod.Read.All)
+            try {
+                $authMethods = @(Get-MgUserAuthenticationMethod -UserId $uid -ErrorAction Stop)
+                $mfaMethods = @($authMethods | Where-Object {
+                    $_.AdditionalProperties["@odata.type"] -in $mfaTypes
+                })
+                $hasMFA    = $mfaMethods.Count -gt 0
+                $methodSrc = "AuthenticationMethod API"
+                $debugMsgs.Add("User $upn - $($authMethods.Count) methods found, $($mfaMethods.Count) MFA")
+            } catch {
+                $debugMsgs.Add("AuthMethod API falhou para $upn`: $($_.Exception.Message)")
+            }
+
+            # --- Metodo 2 (fallback): verificar via User StrongAuthenticationRequirements (MSOL-style via Graph)
+            if (-not $hasMFA -and $methodSrc -eq "N/A") {
+                try {
+                    $userDetail = Get-MgUser -UserId $uid `
+                        -Property "Id,UserPrincipalName,StrongAuthenticationDetail" `
+                        -ErrorAction SilentlyContinue
+                    if ($userDetail -and $userDetail.AdditionalProperties.ContainsKey("strongAuthenticationDetail")) {
+                        $sad = $userDetail.AdditionalProperties["strongAuthenticationDetail"]
+                        if ($sad -and $sad.methods -and $sad.methods.Count -gt 0) {
+                            $hasMFA    = $true
+                            $methodSrc = "StrongAuthDetail"
+                        }
+                    }
+                } catch { $debugMsgs.Add("StrongAuth check $upn`: $($_.Exception.Message)") }
+            }
+
+            # --- Metodo 3 (fallback): verificar via Reports API - per-user MFA state
+            if (-not $hasMFA -and $methodSrc -eq "N/A") {
+                try {
+                    $regDetail = Get-MgReportAuthenticationMethodUserRegistrationDetail `
+                        -UserRegistrationDetailsId $uid -ErrorAction Stop
+                    if ($regDetail) {
+                        $hasMFA    = $regDetail.IsMfaRegistered -or $regDetail.IsMfaCapable
+                        $methodSrc = "RegistrationDetail (isMfaRegistered=$($regDetail.IsMfaRegistered))"
+                    }
+                } catch { $debugMsgs.Add("RegistrationDetail $upn`: $($_.Exception.Message)") }
+            }
+
+            [PSCustomObject]@{
+                UserId        = $uid
+                UPN           = $upn
+                RoleId        = $task.RoleId
+                MFAConfigured = $hasMFA
+                MethodCount   = $mfaMethods.Count
+                DetectionSrc  = $methodSrc
+                DebugMsgs     = @($debugMsgs)
+            }
+        }
+
+        $mfaResultsRaw = Invoke-IRParallelForEach -InputObject @($memberTasks) -ScriptBlock $mfaCheckScript -ThrottleLimit 5
+
+        foreach ($result in $mfaResultsRaw) {
+            foreach ($dm in $result.DebugMsgs) { Write-DebugError "MFAStatus" $dm $null }
+
+            $record = [PSCustomObject]@{
+                UserId        = $result.UserId
+                UPN           = $result.UPN
+                RoleId        = $result.RoleId
+                MFAConfigured = $result.MFAConfigured
+                MethodCount   = $result.MethodCount
+                DetectionSrc  = $result.DetectionSrc
+            }
+            $adminsMFAResults.Add($record)
+
+            if (-not $result.MFAConfigured -and $result.DetectionSrc -ne "N/A") {
+                # So reportar como sem MFA se conseguimos verificar E nao tem
+                Write-IRLog "ADMIN SEM MFA VERIFICADO: $($result.UPN) (via $($result.DetectionSrc)) [T1556.006]" `
+                    -Severity "CRITICAL" -MITRETechnique "T1556.006" -MITRETactic "Defense Evasion" -Data $record
+            } elseif ($result.DetectionSrc -eq "N/A") {
+                Write-IRLog "MFA nao verificavel para $($result.UPN) - scope UserAuthenticationMethod.Read.All pode estar em falta" `
+                    -Severity "INFO"
+            } else {
+                Write-IRLog "Admin com MFA: $($result.UPN) ($($result.DetectionSrc))" -Severity "INFO"
+            }
         }
         Export-IRData -FileName "02_admin_mfa_status" -Data $adminsMFAResults
         
@@ -929,7 +1005,54 @@ function Get-MFAStatus {
                 -Severity "MEDIUM" -MITRETechnique "T1562.008" -MITRETactic "Defense Evasion"
             Export-IRData -FileName "02_ca_disabled_policies" -Data ($disabledPolicies | Select-Object DisplayName, State, CreatedDateTime, ModifiedDateTime)
         }
-        
+
+        # Novos metodos de autenticacao registados (T1556.006/T1098.002 - backdoor MFA)
+        # Um atacante com sessao/token roubado regista o seu proprio Authenticator/telefone
+        # para manter acesso mesmo apos reset de password. "Admin registered security info"
+        # com Actor != Target e um indicador forte de persistencia via delegacao.
+        Write-Host "  >> Verificando registo de novos metodos de autenticacao (UAL)..." -ForegroundColor Gray
+        if (-not $Script:SkipUAL) {
+            try {
+                $authRegEvents = Invoke-UALSearch `
+                    -StartDate $Script:StartDate -EndDate $Script:EndDate `
+                    -Operations @("Admin registered security info", "User registered security info", "User registered all required security info") `
+                    -RecordType "AzureActiveDirectory" -ResultSize 1000 -ErrorAction SilentlyContinue
+
+                $authRegResults = [System.Collections.Generic.List[PSObject]]::new()
+                foreach ($ev in $authRegEvents) {
+                    $audit = $null
+                    try { $audit = $ev.AuditData | ConvertFrom-Json } catch { continue }
+
+                    $targetEntry = @(Get-JsonProperty $audit "Target" @()) | Where-Object { (Get-JsonProperty $_ "Type" -1) -eq 0 } | Select-Object -First 1
+                    $targetUpn   = if ($targetEntry) { Get-JsonProperty $targetEntry "ID" $ev.UserIds } else { $ev.UserIds }
+
+                    $actorEntry  = @(Get-JsonProperty $audit "Actor" @()) | Where-Object { (Get-JsonProperty $_ "Type" -1) -eq 0 } | Select-Object -First 1
+                    $actorUpn    = if ($actorEntry) { Get-JsonProperty $actorEntry "ID" $ev.UserIds } else { $ev.UserIds }
+
+                    $record = [PSCustomObject]@{
+                        Timestamp = $ev.CreationDate
+                        Operation = $ev.Operations
+                        Actor     = $actorUpn
+                        Target    = $targetUpn
+                    }
+                    $authRegResults.Add($record)
+
+                    if ($ev.Operations -eq "Admin registered security info" -and $actorUpn -and $targetUpn -and ($actorUpn -ne $targetUpn)) {
+                        Write-IRLog "Metodo de autenticacao registado por ADMIN para outro utilizador: $actorUpn >> $targetUpn [T1098.002]" `
+                            -Severity "HIGH" -MITRETechnique "T1098.002" -MITRETactic "Persistence" -Data $record
+                    } elseif ($Script:WatchlistUsers -contains $targetUpn) {
+                        Write-IRLog "Novo metodo de autenticacao registado (utilizador em watchlist): $targetUpn [T1556.006]" `
+                            -Severity "MEDIUM" -MITRETechnique "T1556.006" -MITRETactic "Persistence" -Data $record
+                    }
+                }
+
+                if ($authRegResults.Count -gt 0) {
+                    Write-IRLog "Registos de metodos de autenticacao no periodo: $($authRegResults.Count)" -Severity "INFO"
+                    Export-IRData -FileName "02_auth_method_registrations" -Data $authRegResults
+                }
+            } catch { Write-IRLog "Erro ao verificar registo de metodos de autenticacao: $_" -Severity "INFO" }
+        }
+
     } catch {
         Write-IRLog "Erro no modulo MFA: $_" -Severity "INFO"
     }
@@ -1099,9 +1222,42 @@ function Get-ExchangeSuspiciousActivity {
             }
         }
         Export-IRData -FileName "04_suspicious_inbox_rules" -Data $suspiciousRules
-        
+
     } catch { Write-IRLog "Erro ao verificar inbox rules: $_" -Severity "INFO" }
-    
+
+    # Mailbox Audit Bypass / Audit Disabled (T1562.008 - Disable/Modify Logging)
+    Write-Host "  >> Verificando bypass de mailbox audit logging..." -ForegroundColor Gray
+    try {
+        $auditIssues = [System.Collections.Generic.List[PSObject]]::new()
+
+        $auditDisabled = @($allMailboxes | Where-Object { $_.AuditEnabled -eq $false })
+        foreach ($mbx in $auditDisabled) {
+            $record = [PSCustomObject]@{
+                Mailbox = $mbx.UserPrincipalName
+                Issue   = "AuditEnabled=False"
+            }
+            $auditIssues.Add($record)
+            Write-IRLog "Mailbox audit DESATIVADO: $($mbx.UserPrincipalName) [T1562.008]" `
+                -Severity "HIGH" -MITRETechnique "T1562.008" -MITRETactic "Defense Evasion" -Data $record
+        }
+
+        $bypassAssoc = @(Get-MailboxAuditBypassAssociation -ResultSize Unlimited -ErrorAction SilentlyContinue |
+            Where-Object { $_.AuditBypassEnabled -eq $true })
+        foreach ($ba in $bypassAssoc) {
+            $record = [PSCustomObject]@{
+                Mailbox = $ba.Name
+                Issue   = "AuditBypassEnabled=True"
+            }
+            $auditIssues.Add($record)
+            Write-IRLog "Mailbox audit BYPASS activo: $($ba.Name) - acoes deste utilizador nao sao registadas em nenhuma mailbox [T1562.008]" `
+                -Severity "CRITICAL" -MITRETechnique "T1562.008" -MITRETactic "Defense Evasion" -Data $record
+        }
+
+        if ($auditIssues.Count -gt 0) {
+            Export-IRData -FileName "04_mailbox_audit_bypass" -Data $auditIssues
+        }
+    } catch { Write-IRLog "Erro ao verificar mailbox audit bypass: $_" -Severity "INFO" }
+
     # External Mail Forwarding (Mailbox level)
     # FIX BUG_FWD_FALSEPOS: filtrar forwardings internos ao mesmo dominio
     Write-Host "  >> Verificando forwarding externo ao nivel do mailbox..." -ForegroundColor Gray
@@ -1439,6 +1595,171 @@ function Get-CriticalAuditEvents {
             }
         }
     } catch { Write-IRLog "Bulk download analysis: $_" -Severity "INFO" }
+}
+
+# ============================================================
+# MODULO 27: MAILBOX ACCESS FORENSICS (T1114.002/T1213)
+# ============================================================
+
+function Get-MailboxAccessForensics {
+    # T1114.002 - Remote Email Collection | T1213 - Data from Information Repositories
+    # Correlaciona MailItemsAccessed/Send/SearchQueryInitiated (M365 Advanced Audit, requer E5)
+    # com utilizadores ja identificados como CRITICAL/HIGH ou em watchlist - para
+    # responder a "o que foi exfiltrado/lido/enviado depois do compromisso?"
+    Write-Section "MAILBOX ACCESS FORENSICS (MailItemsAccessed/Send)" "T1114.002/T1213" "Collection"
+
+    if ($Script:SkipUAL) { Write-IRLog "UAL skipped por parametro" -Severity "INFO"; return }
+
+    if (-not (Test-UALAvailable)) {
+        Write-IRLog "Search-UnifiedAuditLog indisponivel - requer Exchange Online conectado" -Severity "HIGH"
+        return
+    }
+
+    try {
+        # ---- Utilizadores de interesse: findings CRITICAL/HIGH + watchlist ----
+        $focusUsers = [System.Collections.Generic.List[string]]::new()
+        foreach ($f in $Script:Findings) {
+            if ($f.Severity -notin @("CRITICAL","HIGH")) { continue }
+            [regex]::Matches($f.Message, '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}') | ForEach-Object {
+                if ($focusUsers -notcontains $_.Value) { $focusUsers.Add($_.Value) }
+            }
+        }
+        foreach ($wu in $Script:WatchlistUsers) {
+            if ($focusUsers -notcontains $wu) { $focusUsers.Add($wu) }
+        }
+
+        if ($focusUsers.Count -eq 0) {
+            Write-IRLog "Mailbox Access Forensics: sem utilizadores de interesse (sem findings CRITICAL/HIGH nem watchlist) - modulo ignorado" -Severity "INFO"
+            return
+        }
+
+        Write-Host "  >> A correlacionar acesso a mailboxes para $($focusUsers.Count) utilizador(es) de interesse..." -ForegroundColor Gray
+
+        # ---- MailItemsAccessed: leitura/sincronizacao de email apos compromisso ----
+        $accessEvents = Invoke-UALSearch `
+            -StartDate $Script:StartDate -EndDate $Script:EndDate `
+            -Operations @("MailItemsAccessed") -ResultSize 5000 -ErrorAction SilentlyContinue
+
+        if ($accessEvents.Count -eq 0) {
+            Write-IRLog "MailItemsAccessed: sem eventos no periodo (requer M365 Advanced Audit / licenca E5)" -Severity "INFO"
+        } else {
+            $accessParsed = foreach ($ev in $accessEvents) {
+                try { $audit = $ev.AuditData | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+
+                $owner = Get-JsonProperty $audit "MailboxOwnerUPN"
+                if (-not $owner -or $owner -notin $focusUsers) { continue }
+
+                $accessType  = "Unknown"
+                $isThrottled = $false
+                foreach ($p in (Get-JsonProperty $audit "OperationProperties" @())) {
+                    $pName  = Get-JsonProperty $p "Name"
+                    $pValue = Get-JsonProperty $p "Value"
+                    if ($pName -eq "MailAccessType") { $accessType  = $pValue }
+                    if ($pName -eq "IsThrottled")    { $isThrottled = $pValue }
+                }
+
+                $itemCount = 0
+                foreach ($folder in (Get-JsonProperty $audit "Folders" @())) {
+                    $itemCount += @(Get-JsonProperty $folder "FolderItems" @()).Count
+                }
+
+                [PSCustomObject]@{
+                    Timestamp     = $ev.CreationDate
+                    MailboxOwner  = $owner
+                    AccessedBy    = Get-JsonProperty $audit "UserId"
+                    ClientIP      = Get-JsonProperty $audit "ClientIPAddress"
+                    AccessType    = $accessType
+                    IsThrottled   = $isThrottled
+                    ItemsAccessed = $itemCount
+                }
+            }
+
+            if ($accessParsed) {
+                Export-IRData -FileName "27_mailbox_access_focus_users" -Data $accessParsed
+
+                foreach ($ug in ($accessParsed | Group-Object MailboxOwner)) {
+                    $syncEvents = @($ug.Group | Where-Object { $_.AccessType -eq "Sync" })
+                    $totalItems = ($ug.Group | Measure-Object -Property ItemsAccessed -Sum).Sum
+                    $uniqueIPs  = @($ug.Group.ClientIP | Sort-Object -Unique)
+                    $thirdParty = @($ug.Group | Where-Object { $_.AccessedBy -and $_.AccessedBy -ne $ug.Name })
+
+                    $sev = if ($thirdParty.Count -gt 0 -or $syncEvents.Count -gt 5) { "CRITICAL" } else { "HIGH" }
+                    Write-IRLog "Mailbox Access: '$($ug.Name)' >> $($ug.Count) acessos (Sync=$($syncEvents.Count), itens=$totalItems, IPs=$($uniqueIPs.Count), acesso-3os=$($thirdParty.Count)) [T1114.002]" `
+                        -Severity $sev -MITRETechnique "T1114.002" -MITRETactic "Collection" -Data $ug.Group
+                }
+            }
+        }
+
+        # ---- Send/SendAs por terceiros - indicador forte de BEC ----
+        Write-Host "  >> A verificar envios de email em nome de outro utilizador (SendAs/SendOnBehalf)..." -ForegroundColor Gray
+        $sendEvents = Invoke-UALSearch `
+            -StartDate $Script:StartDate -EndDate $Script:EndDate `
+            -Operations @("Send") -ResultSize 3000 -ErrorAction SilentlyContinue
+
+        if ($sendEvents.Count -eq 0) {
+            Write-IRLog "Send: sem eventos no periodo (requer M365 Advanced Audit / licenca E5)" -Severity "INFO"
+        } else {
+            $sendThirdParty = foreach ($ev in $sendEvents) {
+                try { $audit = $ev.AuditData | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+
+                $owner = Get-JsonProperty $audit "MailboxOwnerUPN"
+                $actor = Get-JsonProperty $audit "UserId"
+                if (-not $owner -or -not $actor) { continue }
+                if ($actor -eq $owner) { continue }
+                if ($actor -match "^S-1-|^NT AUTHORITY") { continue }
+
+                $item = Get-JsonProperty $audit "Item"
+                [PSCustomObject]@{
+                    Timestamp = $ev.CreationDate
+                    Mailbox   = $owner
+                    SentBy    = $actor
+                    ClientIP  = Get-JsonProperty $audit "ClientIPAddress"
+                    Subject   = Get-JsonProperty $item "Subject"
+                }
+            }
+
+            if ($sendThirdParty) {
+                Export-IRData -FileName "27_mailbox_send_thirdparty" -Data $sendThirdParty
+                foreach ($sg in ($sendThirdParty | Group-Object Mailbox)) {
+                    $sev = if ($sg.Name -in $focusUsers) { "CRITICAL" } else { "MEDIUM" }
+                    Write-IRLog "Email enviado em nome de outro utilizador: '$($sg.Name)' <- $($sg.Count) email(s) por terceiros [T1114.002/T1098.002]" `
+                        -Severity $sev -MITRETechnique "T1114.002" -MITRETactic "Collection" -Data $sg.Group
+                }
+            }
+        }
+
+        # ---- SearchQueryInitiated - reconhecimento dentro da mailbox comprometida ----
+        Write-Host "  >> A verificar pesquisas dentro de mailboxes de interesse (reconhecimento)..." -ForegroundColor Gray
+        $searchEvents = Invoke-UALSearch `
+            -StartDate $Script:StartDate -EndDate $Script:EndDate `
+            -Operations @("SearchQueryInitiated") -ResultSize 2000 -ErrorAction SilentlyContinue
+
+        if ($searchEvents.Count -gt 0) {
+            $searchParsed = foreach ($ev in $searchEvents) {
+                try { $audit = $ev.AuditData | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+
+                $owner = Get-JsonProperty $audit "MailboxOwnerUPN"
+                if (-not $owner -or $owner -notin $focusUsers) { continue }
+
+                [PSCustomObject]@{
+                    Timestamp    = $ev.CreationDate
+                    MailboxOwner = $owner
+                    SearchedBy   = Get-JsonProperty $audit "UserId"
+                    Query        = Get-JsonProperty $audit "SearchQuery"
+                }
+            }
+
+            if ($searchParsed) {
+                $searchParsed = @($searchParsed)
+                Export-IRData -FileName "27_mailbox_search_queries" -Data $searchParsed
+                Write-IRLog "Pesquisas dentro de mailbox de utilizadores de interesse: $($searchParsed.Count) [T1213]" `
+                    -Severity "MEDIUM" -MITRETechnique "T1213" -MITRETactic "Collection" -Data $searchParsed
+            }
+        }
+
+    } catch {
+        Write-DebugError "MailboxAccessForensics" "Erro no modulo" $_
+    }
 }
 
 # ============================================================
@@ -3918,7 +4239,7 @@ function Start-O365IRScriptFull {
     Connect-IRServices
 
     Write-Host ""
-    Write-Host "  Iniciando analise IR completa (23 modulos)..." -ForegroundColor Cyan
+    Write-Host "  Iniciando analise IR completa (26 modulos)..." -ForegroundColor Cyan
 
     # Modulos base
     $Script:_modules = @(
@@ -3931,7 +4252,7 @@ function Start-O365IRScriptFull {
         "Get-ExfiltrationCorrelation","Get-NamedLocationsAndIPAnalysis","Get-DeviceAnomalies",
         "Get-FederationAndExternalIdentityAudit","Get-EmailThreatAnalysis",
         "Get-MFAFatigueHunting","Get-ImpersonationHunting","Get-EnumerationHunting",
-        "Build-AttackTimeline"
+        "Get-MailboxAccessForensics","Build-AttackTimeline"
     )
     foreach ($mod in $Script:_modules) {
         Start-ModuleTimer $mod
