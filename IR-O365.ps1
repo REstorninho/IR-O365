@@ -115,7 +115,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.6.0"
+$Script:Version         = "5.7.0"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -1616,7 +1616,8 @@ function Get-CriticalAuditEvents {
         @{ Ops = @("Set-MsolPasswordPolicy","Set-MsolDomainFederationSettings");          Label = "Auth_Policy_Changes";        MITRE = "T1556.007"; Sev = "CRITICAL" },
         @{ Ops = @("PurviewSearchExportJobSubmitted","ReviewSetExportJobSubmitted","SearchExported"); Label = "eDiscovery_Export_Jobs"; MITRE = "T1213"; Sev = "HIGH" },
         @{ Ops = @("HoldCreated","HoldRemoved","CaseRemoved");                           Label = "eDiscovery_Case_Hold_Changes"; MITRE = "T1070"; Sev = "MEDIUM" },
-        @{ Ops = @("Add member to role completed (PIM activation)","Add member to role outside of PIM (permanent)"); Label = "PIM_Role_Activations"; MITRE = "T1098.003"; Sev = "MEDIUM" }
+        @{ Ops = @("Add member to role completed (PIM activation)","Add member to role outside of PIM (permanent)"); Label = "PIM_Role_Activations"; MITRE = "T1098.003"; Sev = "MEDIUM" },
+        @{ Ops = @("New-InboundConnector","Set-InboundConnector","Remove-InboundConnector","New-OutboundConnector","Set-OutboundConnector","Remove-OutboundConnector"); Label = "Mail_Connector_Changes"; MITRE = "T1114.003"; Sev = "HIGH" }
     )
     
     foreach ($query in $auditQueries) {
