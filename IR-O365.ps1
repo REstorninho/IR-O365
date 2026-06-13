@@ -66,6 +66,9 @@ param(
     [string[]]$WatchlistUsers = @(),
 
     [Parameter(Mandatory = $false)]
+    [string[]]$HoneytokenUsers = @(),
+
+    [Parameter(Mandatory = $false)]
     [switch]$ExportJSON,
 
     [Parameter(Mandatory = $false)]
@@ -112,7 +115,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.5.0"
+$Script:Version         = "5.6.0"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -758,7 +761,25 @@ function Get-SuspiciousSignIns {
                         -Severity "CRITICAL" -MITRETechnique "T1078" -MITRETactic "Initial Access"
                 }
             }
-            
+
+            # Honeytoken / Canary Accounts - qualquer atividade (sucesso ou falha) e
+            # um indicador de compromisso quase certo, ja que estas contas nao devem
+            # ter qualquer uso legitimo [T1078]
+            if ($Script:HoneytokenUsers.Count -gt 0) {
+                $honeytokenSuccess = @($successSignins | Where-Object { $_.UserPrincipalName -in $Script:HoneytokenUsers })
+                $honeytokenFailed = @($failedSignins | Where-Object { $_.UserPrincipalName -in $Script:HoneytokenUsers })
+                $honeytokenHits = @($honeytokenSuccess + $honeytokenFailed)
+
+                if ($honeytokenHits.Count -gt 0) {
+                    Export-IRData -FileName "01_honeytoken_activity" -Data $honeytokenHits
+                    foreach ($hit in $honeytokenHits) {
+                        $resultado = if ($hit.UserPrincipalName -in $honeytokenSuccess.UserPrincipalName) { "SUCESSO" } else { "FALHA" }
+                        Write-IRLog "HONEYTOKEN: atividade detetada na conta-isco $($hit.UserPrincipalName) de $($hit.IPAddress) ($resultado) - INDICADOR FORTE DE COMPROMISSO [T1078]" `
+                            -Severity "CRITICAL" -MITRETechnique "T1078" -MITRETactic "Initial Access" -Data $hit
+                    }
+                }
+            }
+
             # Token Reuse / Session Theft indicators
             $tokenSuspect = @($successSignins | Where-Object {
                 $_.ConditionalAccessStatus -eq "notApplied"
@@ -4054,6 +4075,27 @@ function Get-FederationAndExternalIdentityAudit {
                 Export-IRData -FileName "22_cross_tenant_partners" -Data ($partners | Select-Object TenantId, IsServiceProvider, AutomaticUserConsentSettings)
             }
         } catch { Write-IRLog "Cross-Tenant Access: permissoes insuficientes ou nao disponivel" -Severity "INFO" }
+
+        # Cross-Tenant Access - Inbound Trust settings (T1199/T1556.009)
+        # Se o tenant aceita MFA/compliant device claims de qualquer tenant externo por
+        # defeito, uma conta comprometida noutro tenant que ja satisfez MFA la pode
+        # herdar esse claim aqui e contornar CA policies baseadas em MFA.
+        Write-Host "  >> Verificando Inbound Trust settings (Cross-Tenant Access)..." -ForegroundColor Gray
+        try {
+            $defaultXTAP = Get-MgPolicyCrossTenantAccessPolicyDefault -ErrorAction SilentlyContinue
+            if ($defaultXTAP -and $defaultXTAP.InboundTrust) {
+                $trust = $defaultXTAP.InboundTrust
+                $trustedClaims = @()
+                if ($trust.IsMfaAccepted -eq $true) { $trustedClaims += "MFA" }
+                if ($trust.IsCompliantDeviceAccepted -eq $true) { $trustedClaims += "CompliantDevice" }
+                if ($trust.IsHybridAzureADJoinedDeviceAccepted -eq $true) { $trustedClaims += "HybridAzureADJoined" }
+
+                if ($trustedClaims.Count -gt 0) {
+                    Write-IRLog "Cross-Tenant Access (default): claims de tenants externos sao confiados - $($trustedClaims -join ', ') - uma conta comprometida noutro tenant pode herdar estes claims e contornar CA policies [T1556.009]" `
+                        -Severity "MEDIUM" -MITRETechnique "T1556.009" -MITRETactic "Defense Evasion"
+                }
+            }
+        } catch { Write-IRLog "Cross-Tenant Inbound Trust: permissoes insuficientes ou nao disponivel" -Severity "INFO" }
 
         # Verificar se AAD Connect / Entra Connect esta configurado
         Write-Host "  >> Verificando Entra Connect (Hybrid Identity)..." -ForegroundColor Gray
