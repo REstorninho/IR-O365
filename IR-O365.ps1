@@ -115,7 +115,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.8.0"
+$Script:Version         = "5.9.0"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -130,6 +130,7 @@ $Script:ModuleOrder = [System.Collections.Generic.List[string]]::new()
 $Script:Stats       = @{ CRITICAL = 0; HIGH = 0; MEDIUM = 0; LOW = 0; INFO = 0 }
 $Script:StartDate   = (Get-Date).AddDays(-$DaysBack)
 $Script:EndDate     = Get-Date
+$Script:AttackTimeline = @()
 
 # FIX BUG_SCOPE_ALL_SKIPS: Promover todos os parametros Skip para script-scope
 # Assim funcoes que fazem $Script:SkipX = $true afetam todas as leituras subsequentes
@@ -2506,6 +2507,106 @@ $(if ($hasEv) { "<tr id='$rid' class='er' style='display:none'><td colspan='4'><
         $modCards += "<div class='mc2'><span class='md $cls'></span><span class='mn'>$([System.Web.HttpUtility]::HtmlEncode($m.N))</span><span class='ml2'>$lbl$lnk</span></div>"
     }
 
+    # ---- Sumario Executivo: risk score ----
+    $riskScoreRaw = ($critCount*25) + ($highCount*10) + ($medCount*3) + ($lowCount*1)
+    $riskScore    = [math]::Min(100, $riskScoreRaw)
+    if     ($riskScore -ge 75) { $riskLabel = "CRITICO"; $riskCls = "r-red" }
+    elseif ($riskScore -ge 50) { $riskLabel = "ALTO";    $riskCls = "r-ora" }
+    elseif ($riskScore -ge 25) { $riskLabel = "MEDIO";   $riskCls = "r-yel" }
+    elseif ($riskScore -ge 1)  { $riskLabel = "BAIXO";   $riskCls = "r-blu" }
+    else                       { $riskLabel = "OK";      $riskCls = "r-grn" }
+
+    # ---- Sumario Executivo: top entidades correlacionadas (Attack Timeline) ----
+    $topEntities = @()
+    if ($Script:AttackTimeline -and @($Script:AttackTimeline).Count -gt 0) {
+        $topEntities = @($Script:AttackTimeline | Sort-Object CriticalCount, HighCount -Descending | Select-Object -First 5)
+    }
+
+    # ---- Sumario Executivo: narrativa em linguagem simples ----
+    $narrativeParts = [System.Collections.Generic.List[string]]::new()
+    if ($totalFindings -eq 0) {
+        $narrativeParts.Add("Nao foram identificadas atividades suspeitas relevantes no periodo analisado ($($Script:StartDate.ToString('yyyy-MM-dd')) a $($Script:EndDate.ToString('yyyy-MM-dd'))). O tenant '$(hx $Script:TenantName)' nao apresenta indicadores de comprometimento nos modulos executados.")
+    } else {
+        $narrativeParts.Add("A analise ao tenant '$(hx $Script:TenantName)' entre $($Script:StartDate.ToString('yyyy-MM-dd')) e $($Script:EndDate.ToString('yyyy-MM-dd')) identificou $totalFindings findings ($critCount CRITICAL, $highCount HIGH, $medCount MEDIUM, $lowCount LOW).")
+        if ($topEntities.Count -gt 0) {
+            $tNames = ($topEntities | ForEach-Object { hx $_.User }) -join ", "
+            $narrativeParts.Add("As entidades com maior concentracao de atividade suspeita correlacionada sao: $tNames.")
+        }
+        if ($critCount -gt 0) {
+            $narrativeParts.Add("Existem $critCount findings CRITICAL que requerem investigacao e contencao imediata.")
+        } elseif ($highCount -gt 0) {
+            $narrativeParts.Add("Nao foram identificados findings CRITICAL, mas os $highCount findings HIGH devem ser investigados a curto prazo.")
+        }
+    }
+    $execNarrative = $narrativeParts -join " "
+
+    # ---- Sumario Executivo: acoes prioritarias (por tecnica MITRE em findings CRITICAL/HIGH) ----
+    $actionMap = [ordered]@{
+        "T1078" = "Repor credenciais e revisar acessos das contas comprometidas; forcar reautenticacao MFA."
+        "T1110" = "Bloquear IPs de origem de password spraying/brute force e reforcar Conditional Access (bloqueio por localizacao/risco)."
+        "T1098" = "Revogar credenciais/segredos de longa duracao em aplicacoes OAuth e rotacionar regularmente."
+        "T1114" = "Remover regras de inbox/forwarding suspeitas e auditar conectores de transporte."
+        "T1556" = "Reforcar politicas de MFA/Conditional Access e desativar protocolos de autenticacao legacy (IMAP/POP/ActiveSync)."
+        "T1562" = "Investigar e restaurar configuracoes de seguranca alteradas (DLP, audit log, holds) e restringir quem pode altera-las."
+        "T1530" = "Rever permissoes de partilha externa/anonima no SharePoint/OneDrive e remover acessos nao autorizados."
+        "T1528" = "Revogar tokens/refresh tokens emitidos a aplicacoes suspeitas."
+        "T1550" = "Invalidar sessoes/tokens ativos das contas afetadas (revoke sign-in sessions)."
+        "T1136" = "Validar criacao de contas/atribuicoes de roles nao autorizadas e remover acessos indevidos."
+        "T1531" = "Restaurar acesso de contas bloqueadas/alteradas indevidamente e validar integridade das contas."
+        "T1070" = "Investigar remocao de holds/logs de auditoria; restaurar protecoes e preservar evidencia."
+        "T1048" = "Bloquear canais de exfiltracao identificados e rever politicas de DLP."
+        "T1567" = "Bloquear destinos de exfiltracao via servicos cloud externos e rever politicas de DLP."
+        "T1564" = "Investigar tecnicas de ocultacao (regras, pastas) usadas para esconder atividade maliciosa."
+        "T1539" = "Invalidar cookies de sessao roubados e forcar novo login em todos os dispositivos."
+        "T1556.009" = "Restringir trust inbound de cross-tenant access e validar parceiros federados."
+    }
+    $actionCounts = @{}
+    foreach ($f in $Script:Findings) {
+        if ($f.Severity -notin @("CRITICAL","HIGH") -or -not $f.Technique) { continue }
+        $pfx = $f.Technique.Split('.')[0].Trim()
+        if (-not $actionCounts.ContainsKey($pfx)) { $actionCounts[$pfx] = 0 }
+        $actionCounts[$pfx]++
+    }
+    $actionsHTML = ""
+    $actionN = 0
+    foreach ($pfx in ($actionCounts.Keys | Sort-Object { $actionCounts[$_] } -Descending)) {
+        if (-not $actionMap.Contains($pfx)) { continue }
+        $actionN++
+        if ($actionN -gt 6) { break }
+        $actionsHTML += "<li><b>$actionN.</b> $($actionMap[$pfx]) <span class='exec-act-n'>($pfx &middot; $($actionCounts[$pfx]) findings)</span></li>"
+    }
+    if (-not $actionsHTML) { $actionsHTML = "<li>Sem acoes prioritarias identificadas - nenhum finding CRITICAL/HIGH com tecnica MITRE associada.</li>" }
+
+    # ---- Sumario Executivo: distribuicao por tatica MITRE (grafico CSS) ----
+    $tacticCounts = @{}
+    foreach ($f in $Script:Findings) {
+        if (-not $f.Tactic) { continue }
+        if (-not $tacticCounts.ContainsKey($f.Tactic)) { $tacticCounts[$f.Tactic] = 0 }
+        $tacticCounts[$f.Tactic]++
+    }
+    $barRows = ""
+    if ($tacticCounts.Count -gt 0) {
+        $maxTac = ($tacticCounts.Values | Measure-Object -Maximum).Maximum
+        foreach ($tac in ($tacticCounts.Keys | Sort-Object { $tacticCounts[$_] } -Descending)) {
+            $n   = $tacticCounts[$tac]
+            $pct = if ($maxTac -gt 0) { [math]::Round(($n / $maxTac) * 100, 1) } else { 0 }
+            $barRows += "<div class='ebar-row'><span class='ebar-lbl' title='$(hx $tac)'>$(hx $tac)</span><div class='ebar-track'><div class='ebar-fill' style='width:$pct%'></div></div><span class='ebar-n'>$n</span></div>"
+        }
+    } else {
+        $barRows = "<p class='empty'>Sem findings com tatica MITRE associada.</p>"
+    }
+
+    # ---- Sumario Executivo: tabela top 5 entidades ----
+    if ($topEntities.Count -gt 0) {
+        $execTopEntitiesRows = ""
+        foreach ($te in $topEntities) {
+            $execTopEntitiesRows += "<tr><td class='upn'>$(hx $te.User)</td><td class='n sc'>$($te.CriticalCount)</td><td class='n sh'>$($te.HighCount)</td><td class='sm-txt'>$(hx $te.AttackPattern)</td><td class='sm-txt'>$(hx $te.FirstObserved) &rarr; $(hx $te.LastObserved)</td></tr>"
+        }
+        $execTopEntitiesHTML = "<table class='ut'><thead><tr><th>Entidade</th><th>CRIT</th><th>HIGH</th><th>Padrao de Ataque</th><th>Periodo</th></tr></thead><tbody>$execTopEntitiesRows</tbody></table>"
+    } else {
+        $execTopEntitiesHTML = "<p class='empty'>Sem entidades correlacionadas com atividade CRITICAL/HIGH.</p>"
+    }
+
     # ---- Build report path info ----
     $graphAcc = try { (Get-MgContext -ErrorAction SilentlyContinue).Account } catch { "N/A" }
     $exoSt    = if (Test-EXOAvailable) { "Conectado" } else { "Nao disponivel" }
@@ -2578,6 +2679,47 @@ code,pre,.mono{font-family:var(--mono);font-size:.85em}
 /* Risk bar */
 .rbar{height:4px;background:var(--s3);border-radius:2px;overflow:hidden;display:flex;margin-bottom:1.25rem}
 .rbar-s{height:100%}
+
+/* Executive Summary */
+.exec-meta{font-size:.72rem;color:var(--t3);margin-bottom:1rem}
+.exec-hero{display:flex;gap:1.4rem;align-items:center;background:var(--s2);border:1px solid var(--b1);border-radius:var(--r);padding:1.1rem 1.4rem;margin-bottom:1.25rem}
+.exec-score{flex-shrink:0;width:92px;height:92px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;border:3px solid var(--b2);font-family:var(--mono)}
+.exec-score.r-red{border-color:var(--red);color:var(--red)}
+.exec-score.r-ora{border-color:var(--ora);color:var(--ora)}
+.exec-score.r-yel{border-color:var(--yel);color:var(--yel)}
+.exec-score.r-blu{border-color:var(--blu);color:var(--blu)}
+.exec-score.r-grn{border-color:var(--grn);color:var(--grn)}
+.exec-score-n{font-size:1.6rem;font-weight:700;line-height:1}
+.exec-score-l{font-size:.6rem;letter-spacing:.08em;margin-top:.2rem}
+.exec-hero-txt h2{font-size:1rem;font-weight:600;color:var(--tx);margin-bottom:.45rem}
+.exec-hero-txt p{font-size:.82rem;color:var(--t2);line-height:1.6;max-width:820px}
+.exec-actions{list-style:none;display:flex;flex-direction:column;gap:.4rem;margin-bottom:1.25rem}
+.exec-actions li{background:var(--s2);border:1px solid var(--b1);border-radius:var(--r);padding:.55rem .85rem;font-size:.8rem;color:var(--tx);line-height:1.5}
+.exec-actions li b{color:var(--ora);font-family:var(--mono);font-size:.75rem}
+.exec-act-n{color:var(--t3);font-size:.7rem;margin-left:.3rem}
+.ebar-row{display:flex;align-items:center;gap:.6rem;margin-bottom:.4rem}
+.ebar-lbl{width:170px;font-size:.72rem;color:var(--t2);flex-shrink:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ebar-track{flex:1;height:14px;background:var(--s3);border-radius:3px;overflow:hidden}
+.ebar-fill{height:100%;background:var(--ora);border-radius:3px}
+.ebar-n{width:28px;text-align:right;font-family:var(--mono);font-size:.72rem;color:var(--t3)}
+#printBtn{background:var(--s2);border:1px solid var(--b1);color:var(--t2);border-radius:3px;padding:.22rem .7rem;font-size:.7rem;cursor:pointer;font-family:var(--sans)}
+#printBtn:hover{color:var(--tx);border-color:var(--b3)}
+#bar-class{font-family:var(--mono);font-size:.62rem;color:var(--t3);border:1px solid var(--b2);padding:.1rem .4rem;border-radius:3px;letter-spacing:.08em}
+
+/* Impressao / exportacao PDF */
+@media print{
+  :root{
+    --bg:#ffffff;--s1:#ffffff;--s2:#f3f4f6;--s3:#e8eaed;--s4:#dde1e6;
+    --b1:#ccc;--b2:#bbb;--b3:#999;
+    --tx:#111;--t2:#444;--t3:#666;--t4:#999;
+  }
+  #bar,#sidebar,.tb,.eb,#printBtn{display:none!important}
+  #layout{display:block}
+  #content{padding:0 1rem}
+  .panel{display:block!important;margin-bottom:2rem;page-break-inside:avoid}
+  body{background:#fff}
+  .ftbl,.ut{font-size:.72rem}
+}
 
 /* Section heading */
 .sh{font-size:.7rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);margin-bottom:.6rem;display:flex;align-items:center;gap:.5rem}
@@ -2679,6 +2821,8 @@ code,pre,.mono{font-family:var(--mono);font-size:.85em}
   <span id="bar-logo">IR&#x2013;O365</span>
   <span id="bar-ver">v$($Script:Version)</span>
   <span id="bar-tenant">$(hx $Script:TenantName) &nbsp;&middot;&nbsp; $(hx $Script:TenantId)</span>
+  <span id="bar-class">RESTRITO</span>
+  <button id="printBtn" onclick="window.print()">Exportar / Imprimir</button>
 </div>
 
 <div id="layout">
@@ -2686,7 +2830,11 @@ code,pre,.mono{font-family:var(--mono);font-size:.85em}
 <!-- Sidebar -->
 <nav id="sidebar">
   <div class="nav-section">Relatorio</div>
-  <div class="nav-item active" onclick="sw(this,'findings')">
+  <div class="nav-item active" onclick="sw(this,'exec')">
+    <span class="nav-dot" style="background:var(--ora)"></span>
+    Sumario Executivo
+  </div>
+  <div class="nav-item" onclick="sw(this,'findings')">
     <span class="nav-dot" style="background:var(--blu)"></span>
     Findings
     <span class="nav-badge$(if($critCount -gt 0){' red'} else {''})" id="fc">$totalFindings</span>
@@ -2729,8 +2877,34 @@ code,pre,.mono{font-family:var(--mono);font-size:.85em}
 <!-- Content -->
 <main id="content">
 
+<!-- PANEL: Sumario Executivo -->
+<div class="panel active" id="p-exec">
+  <div class="sh">Sumario Executivo</div>
+  <div class="exec-meta">Tenant <b>$(hx $Script:TenantName)</b> &nbsp;&middot;&nbsp; Periodo analisado: $($Script:StartDate.ToString('yyyy-MM-dd')) a $($Script:EndDate.ToString('yyyy-MM-dd')) &nbsp;&middot;&nbsp; Gerado em $(Get-Date -Format 'yyyy-MM-dd HH:mm')</div>
+
+  <div class="exec-hero">
+    <div class="exec-score $riskCls">
+      <div class="exec-score-n">$riskScore</div>
+      <div class="exec-score-l">$riskLabel</div>
+    </div>
+    <div class="exec-hero-txt">
+      <h2>Nivel de Risco: $riskLabel</h2>
+      <p>$execNarrative</p>
+    </div>
+  </div>
+
+  <div class="sh" style="margin-top:.75rem">Acoes Prioritarias</div>
+  <ol class="exec-actions">$actionsHTML</ol>
+
+  <div class="sh" style="margin-top:.75rem">Distribuicao de Findings por Tatica MITRE ATT&amp;CK</div>
+  <div style="margin-bottom:1.25rem">$barRows</div>
+
+  <div class="sh" style="margin-top:.75rem">Top Entidades em Risco</div>
+  $execTopEntitiesHTML
+</div>
+
 <!-- PANEL: Findings -->
-<div class="panel active" id="p-findings">
+<div class="panel" id="p-findings">
   <div class="sh">Overview</div>
   <div class="cards">
     <div class="card c-crit"><div class="card-n">$critCount</div><div class="card-l">Critical</div></div>
@@ -4157,7 +4331,8 @@ function Build-AttackTimeline {
         }
     }
 
-    Export-IRData -FileName "21_attack_timeline" -Data ($timelineData | Sort-Object CriticalCount -Descending)
+    $Script:AttackTimeline = @($timelineData | Sort-Object CriticalCount, HighCount -Descending)
+    Export-IRData -FileName "21_attack_timeline" -Data $Script:AttackTimeline
     Write-IRLog "Attack Timeline: $($timelineData.Count) utilizadores com atividade suspeita correlacionada" -Severity "INFO"
 }
 
