@@ -1,6 +1,6 @@
 # IR-O365 — Office 365 Incident Response Script
 
-**Versão actual: 5.7.0**  
+**Versão actual: 5.8.0**  
 Ferramenta de Incident Response para Microsoft 365 / Entra ID, mapeada contra a matriz [MITRE ATT&CK Enterprise — Office Suite Platform v18](https://attack.mitre.org/matrices/enterprise/cloud/officesuite/).
 
 ---
@@ -234,6 +234,7 @@ Cada execução começa com `Disconnect-MgGraph` + `Disconnect-ExchangeOnline` a
 
 | Versão | Alterações principais |
 |---|---|
+| 5.8.0 | Módulo 05 `Get-ExchangeSuspiciousActivity`: novo check de protocolos legacy ativos por mailbox (`Get-CASMailbox` - IMAP/POP/ActiveSync, T1556.006, HIGH - contornam Legacy Auth block a nivel de tenant/CA) + deteção via UAL de alterações `Set-CASMailbox` (MEDIUM), exportado para `04_legacy_protocols_per_mailbox.csv` e `04_cas_mailbox_changes_ual.csv`; novo check de remoção de Litigation Hold via UAL `Set-Mailbox` (`LitigationHoldEnabled` -> False, T1070, HIGH - anti-forense), exportado para `04_litigation_hold_removed.csv`; módulo 06 `Get-SuspiciousOAuthApps`: novo check de credenciais de longa duração em apps/SPs (secrets/certs com validade > 2 anos, T1098.001, MEDIUM - persistência que sobrevive a rotações normais de credenciais), exportado para `05_apps_longlived_credentials.csv`; nova entrada na tabela `$auditQueries` do módulo 07 `Get-CriticalAuditEvents` (UAL): `DLP_Policy_Changes` (`New/Set/Remove/Disable/Enable-DlpCompliancePolicy`, T1562, HIGH - desativação de DLP pode preceder exfiltração) |
 | 5.7.0 | Nova entrada na tabela `$auditQueries` do módulo 07 `Get-CriticalAuditEvents` (UAL): `Mail_Connector_Changes` (`New/Set/Remove-InboundConnector` e `New/Set/Remove-OutboundConnector`, T1114.003, HIGH - alterações a connectors de mail flow podem permitir relay/exfiltração ou bypass de filtros anti-spam para domínios externos) |
 | 5.6.0 | Novo check no módulo 22 `Get-FederationAndExternalIdentityAudit`: Cross-Tenant Access Inbound Trust (`Get-MgPolicyCrossTenantAccessPolicyDefault`) - deteta se o tenant aceita claims de MFA/compliant device/hybrid Azure AD join de tenants externos por defeito (T1556.009, MEDIUM - uma conta comprometida noutro tenant pode herdar estes claims e contornar CA policies locais); novo parâmetro `-HoneytokenUsers` e check correspondente no módulo 02 `Get-SuspiciousSignIns` - qualquer sign-in (sucesso ou falha) de uma conta-isco gera finding CRITICAL (T1078), exportado para `01_honeytoken_activity.csv` |
 | 5.5.0 | Novas entradas na tabela `$auditQueries` do módulo 07 `Get-CriticalAuditEvents` (UAL): `eDiscovery_Export_Jobs` (`PurviewSearchExportJobSubmitted`/`ReviewSetExportJobSubmitted`/`SearchExported`, T1213, HIGH - exportações em massa via eDiscovery são um vetor de exfiltração pouco monitorizado), `eDiscovery_Case_Hold_Changes` (`HoldCreated`/`HoldRemoved`/`CaseRemoved`, T1070, MEDIUM - remoção de holds pode indicar anti-forense), `PIM_Role_Activations` (`Add member to role completed (PIM activation)`/`Add member to role outside of PIM (permanent)`, T1098.003, MEDIUM - ativações de roles privilegiadas, incluindo atribuições permanentes fora do fluxo PIM) |

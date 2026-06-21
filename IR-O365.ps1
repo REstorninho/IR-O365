@@ -115,7 +115,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.7.0"
+$Script:Version         = "5.8.0"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -1345,7 +1345,100 @@ function Get-ExchangeSuspiciousActivity {
         }
         Export-IRData -FileName "04_all_transport_rules" -Data ($transportRules | Select-Object Name, State, Priority, WhenChanged, WhenCreated)
     } catch { Write-IRLog "Erro ao verificar transport rules: $_" -Severity "INFO" }
-    
+
+    # Protocolos legacy ativos por mailbox (IMAP/POP/ActiveSync) - mesmo com Legacy
+    # Auth bloqueado a nivel de tenant/CA, um atacante pode ativar estes protocolos
+    # numa mailbox especifica para manter acesso persistente que contorna MFA
+    Write-Host "  >> Verificando protocolos legacy ativos por mailbox (IMAP/POP/ActiveSync)..." -ForegroundColor Gray
+    try {
+        $casLegacy = [System.Collections.Generic.List[PSObject]]::new()
+        foreach ($mbx in $allMailboxes) {
+            $cas = Get-CASMailbox -Identity $mbx.UserPrincipalName -ErrorAction SilentlyContinue
+            if ($cas -and ($cas.ImapEnabled -or $cas.PopEnabled -or $cas.ActiveSyncEnabled)) {
+                $protocols = @()
+                if ($cas.ImapEnabled) { $protocols += "IMAP" }
+                if ($cas.PopEnabled) { $protocols += "POP" }
+                if ($cas.ActiveSyncEnabled) { $protocols += "ActiveSync" }
+                $casLegacy.Add([PSCustomObject]@{
+                    UserPrincipalName = $mbx.UserPrincipalName
+                    Protocols         = $protocols -join ";"
+                })
+            }
+        }
+
+        if ($casLegacy.Count -gt 0) {
+            Write-IRLog "Protocolos legacy ativos: $($casLegacy.Count) mailboxes com IMAP/POP/ActiveSync ativo - podem contornar Legacy Auth block/CA mesmo com bloqueio a nivel de tenant [T1556.006]" `
+                -Severity "HIGH" -MITRETechnique "T1556.006" -MITRETactic "Defense Evasion"
+            Export-IRData -FileName "04_legacy_protocols_per_mailbox" -Data $casLegacy
+        }
+
+        # Alteracoes recentes a CASMailbox via UAL - confirmar quem ativou protocolos legacy
+        if (-not $Script:SkipUAL -and (Test-UALAvailable)) {
+            $casChangeEvents = Invoke-UALSearch `
+                -StartDate $Script:StartDate -EndDate $Script:EndDate `
+                -Operations @("Set-CASMailbox") -RecordType "ExchangeAdmin" -ResultSize 1000 -ErrorAction SilentlyContinue
+
+            if ($casChangeEvents.Count -gt 0) {
+                $casChangeResults = foreach ($ev in $casChangeEvents) {
+                    $audit = $null
+                    try { $audit = $ev.AuditData | ConvertFrom-Json } catch { continue }
+
+                    $modProps = Get-JsonProperty $audit "ModifiedProperties" @()
+                    $legacyProp = $modProps | Where-Object { $_.Name -match "ImapEnabled|PopEnabled|ActiveSyncEnabled" }
+
+                    [PSCustomObject]@{
+                        Timestamp = $ev.CreationDate
+                        Actor     = Get-JsonProperty $audit "UserId" $ev.UserIds
+                        Mailbox   = Get-JsonProperty $audit "ObjectId" "N/A"
+                        Alteracoes = ($legacyProp | ForEach-Object { "$($_.Name): $($_.OldValue) -> $($_.NewValue)" }) -join " | "
+                    }
+                }
+                Write-IRLog "Alteracoes a CASMailbox (Set-CASMailbox): $($casChangeEvents.Count) eventos no periodo - verificar se ativaram protocolos legacy [T1556.006]" `
+                    -Severity "MEDIUM" -MITRETechnique "T1556.006" -MITRETactic "Defense Evasion"
+                Export-IRData -FileName "04_cas_mailbox_changes_ual" -Data $casChangeResults
+            }
+        }
+    } catch { Write-IRLog "Erro ao verificar protocolos legacy por mailbox: $_" -Severity "INFO" }
+
+    # Remocao de Litigation Hold (anti-forense) - distinto das holds de eDiscovery/
+    # Purview (HoldCreated/HoldRemoved) ja cobertas no modulo 07; aqui detetamos o
+    # parametro LitigationHoldEnabled num Set-Mailbox a passar para False
+    Write-Host "  >> Verificando remocao de Litigation Hold (UAL)..." -ForegroundColor Gray
+    try {
+        if (-not $Script:SkipUAL -and (Test-UALAvailable)) {
+            $litHoldEvents = Invoke-UALSearch `
+                -StartDate $Script:StartDate -EndDate $Script:EndDate `
+                -Operations @("Set-Mailbox") -RecordType "ExchangeAdmin" -ResultSize 1000 -ErrorAction SilentlyContinue
+
+            $litHoldRemovals = [System.Collections.Generic.List[PSObject]]::new()
+            foreach ($ev in $litHoldEvents) {
+                $audit = $null
+                try { $audit = $ev.AuditData | ConvertFrom-Json } catch { continue }
+
+                $modProps = Get-JsonProperty $audit "ModifiedProperties" @()
+                $litProp  = $modProps | Where-Object { $_.Name -eq "LitigationHoldEnabled" } | Select-Object -First 1
+
+                if ($litProp -and "$($litProp.NewValue)" -match "False") {
+                    $litHoldRemovals.Add([PSCustomObject]@{
+                        Timestamp = $ev.CreationDate
+                        Actor     = Get-JsonProperty $audit "UserId" $ev.UserIds
+                        Mailbox   = Get-JsonProperty $audit "ObjectId" "N/A"
+                        OldValue  = $litProp.OldValue
+                        NewValue  = $litProp.NewValue
+                    })
+                }
+            }
+
+            if ($litHoldRemovals.Count -gt 0) {
+                foreach ($rem in $litHoldRemovals) {
+                    Write-IRLog "Litigation Hold REMOVIDO da mailbox $($rem.Mailbox) por $($rem.Actor) - possivel anti-forense [T1070]" `
+                        -Severity "HIGH" -MITRETechnique "T1070" -MITRETactic "Defense Evasion" -Data $rem
+                }
+                Export-IRData -FileName "04_litigation_hold_removed" -Data $litHoldRemovals
+            }
+        }
+    } catch { Write-IRLog "Erro ao verificar remocao de Litigation Hold: $_" -Severity "INFO" }
+
     # Mailbox Delegations
     # FIX BUG_MBXLOOP: reutilizar $allMailboxes ja obtido acima - sem segundo Get-Mailbox
     Write-Host "  >> Verificando delegacoes de mailbox..." -ForegroundColor Gray
@@ -1482,6 +1575,35 @@ function Get-SuspiciousOAuthApps {
         }
         Export-IRData -FileName "05_apps_recent_credentials" -Data $appsWithRecentCreds
 
+        # Credenciais com validade anomala - secrets/certs muito longos (>2 anos) sao
+        # um vetor de persistencia: sobrevivem a um reset de password e a maioria das
+        # rotacoes de credenciais normais, permitindo acesso continuado pos-incidente
+        Write-Host "  >> Verificando validade de credenciais em applications (long-lived secrets)..." -ForegroundColor Gray
+        $longLivedThresholdDays = 730
+        $longLivedCreds = [System.Collections.Generic.List[PSObject]]::new()
+        foreach ($app in $apps) {
+            $allCreds = @($app.KeyCredentials) + @($app.PasswordCredentials)
+            foreach ($cred in $allCreds) {
+                if (-not $cred.StartDateTime -or -not $cred.EndDateTime) { continue }
+                $validityDays = ((Get-Date $cred.EndDateTime) - (Get-Date $cred.StartDateTime)).TotalDays
+                if ($validityDays -gt $longLivedThresholdDays) {
+                    $longLivedCreds.Add([PSCustomObject]@{
+                        AppName       = $app.DisplayName
+                        AppId         = $app.AppId
+                        CredType      = if ($cred.PSObject.Properties.Name -contains "Key") { "Certificate" } else { "Secret" }
+                        StartDateTime = $cred.StartDateTime
+                        EndDateTime   = $cred.EndDateTime
+                        ValidityYears = [math]::Round($validityDays / 365, 1)
+                    })
+                }
+            }
+        }
+        if ($longLivedCreds.Count -gt 0) {
+            Write-IRLog "Credenciais de longa duracao: $($longLivedCreds.Count) secrets/certs com validade > 2 anos - persistencia que sobrevive a rotacoes normais de credenciais [T1098.001]" `
+                -Severity "MEDIUM" -MITRETechnique "T1098.001" -MITRETactic "Persistence"
+            Export-IRData -FileName "05_apps_longlived_credentials" -Data $longLivedCreds
+        }
+
         # Credenciais adicionadas a service principals via UAL (T1098.001 - Additional Cloud
         # Credentials). Complementa o check acima: cobre tambem SPs sem objeto Application
         # local (apps multi-tenant consentidas noutro tenant) e identifica quem o fez (Actor).
@@ -1617,7 +1739,8 @@ function Get-CriticalAuditEvents {
         @{ Ops = @("PurviewSearchExportJobSubmitted","ReviewSetExportJobSubmitted","SearchExported"); Label = "eDiscovery_Export_Jobs"; MITRE = "T1213"; Sev = "HIGH" },
         @{ Ops = @("HoldCreated","HoldRemoved","CaseRemoved");                           Label = "eDiscovery_Case_Hold_Changes"; MITRE = "T1070"; Sev = "MEDIUM" },
         @{ Ops = @("Add member to role completed (PIM activation)","Add member to role outside of PIM (permanent)"); Label = "PIM_Role_Activations"; MITRE = "T1098.003"; Sev = "MEDIUM" },
-        @{ Ops = @("New-InboundConnector","Set-InboundConnector","Remove-InboundConnector","New-OutboundConnector","Set-OutboundConnector","Remove-OutboundConnector"); Label = "Mail_Connector_Changes"; MITRE = "T1114.003"; Sev = "HIGH" }
+        @{ Ops = @("New-InboundConnector","Set-InboundConnector","Remove-InboundConnector","New-OutboundConnector","Set-OutboundConnector","Remove-OutboundConnector"); Label = "Mail_Connector_Changes"; MITRE = "T1114.003"; Sev = "HIGH" },
+        @{ Ops = @("New-DlpCompliancePolicy","Set-DlpCompliancePolicy","Remove-DlpCompliancePolicy","Disable-DlpCompliancePolicy","Enable-DlpCompliancePolicy"); Label = "DLP_Policy_Changes"; MITRE = "T1562"; Sev = "HIGH" }
     )
     
     foreach ($query in $auditQueries) {
